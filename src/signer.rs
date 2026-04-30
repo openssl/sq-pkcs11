@@ -1,6 +1,6 @@
 use cryptoki::{
     mechanism::Mechanism,
-    object::{Attribute, AttributeType, KeyType, ObjectHandle},
+    object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle},
     session::Session,
 };
 use sequoia_openpgp::{
@@ -94,6 +94,39 @@ pub fn read_public_key(
     }
 }
 
+/// Find the CKO_PUBLIC_KEY object that shares CKA_ID with a private key object.
+///
+/// PKCS#11 mandates that key pairs share a CKA_ID value.  Public key attributes
+/// such as CKA_EC_POINT are only guaranteed to be present on the public key
+/// object, not the private key object.
+fn find_companion_public_key(
+    session: &Session,
+    priv_handle: ObjectHandle,
+) -> Result<ObjectHandle> {
+    let id_attr = session
+        .get_attributes(priv_handle, &[AttributeType::Id])?
+        .into_iter()
+        .find_map(|a| match a {
+            Attribute::Id(v) => Some(v),
+            _ => None,
+        })
+        .ok_or_else(|| Error::UnsupportedKeyType("private key has no CKA_ID".into()))?;
+
+    let mut candidates = session.find_objects(&[
+        Attribute::Class(ObjectClass::PUBLIC_KEY),
+        Attribute::Id(id_attr),
+    ])?;
+
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Error::UnsupportedKeyType(
+                "no CKO_PUBLIC_KEY object found with matching CKA_ID".into(),
+            )
+        })
+}
+
 fn read_rsa_public(
     session: &Session,
     handle: ObjectHandle,
@@ -131,10 +164,14 @@ fn read_rsa_public(
 
 fn read_ec_public(
     session: &Session,
-    handle: ObjectHandle,
+    priv_handle: ObjectHandle,
 ) -> Result<Key<PublicParts, UnspecifiedRole>> {
-    let attrs =
-        session.get_attributes(handle, &[AttributeType::EcParams, AttributeType::EcPoint])?;
+    // CKA_EC_POINT is only on the CKO_PUBLIC_KEY object, not the private key.
+    // Find the companion public key by matching CKA_ID.
+    let pub_handle = find_companion_public_key(session, priv_handle)?;
+
+    let attrs = session
+        .get_attributes(pub_handle, &[AttributeType::EcParams, AttributeType::EcPoint])?;
 
     let mut ec_params = None;
     let mut ec_point = None;
