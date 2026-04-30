@@ -301,17 +301,23 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
     }
 
     for slot in slots {
-        let (token_label, login_required) = pkcs11
-            .get_token_info(slot)
-            .map(|i| (i.label().trim().to_string(), i.login_required()))
-            .unwrap_or_else(|_| ("<no token>".into(), false));
+        let token_info = pkcs11.get_token_info(slot);
 
-        let protection = if login_required {
+        // Skip empty card reader slots when listing — they have no token.
+        if token_info.is_err() {
+            if args.all_slots {
+                println!("Slot {}  [no token present]", slot.id());
+            }
+            continue;
+        }
+        let info = token_info.unwrap();
+        let token_label = info.label().trim().to_string();
+        let protection = if info.login_required() {
             "token-protected (OCS or softcard)"
         } else {
             "module-protected"
         };
-        println!("Slot {slot:?}  token: {token_label}  [{protection}]");
+        println!("Slot {}  token: {token_label}  [{protection}]", slot.id());
 
         let session = match pkcs11.open_ro_session(slot) {
             Ok(s) => s,
@@ -353,7 +359,7 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
                 .ok()
                 .and_then(|attrs| {
                     attrs.into_iter().find_map(|a| match a {
-                        Attribute::KeyType(kt) => Some(format!("{kt:?}")),
+                        Attribute::KeyType(kt) => Some(key_type_name(kt)),
                         _ => None,
                     })
                 })
@@ -363,6 +369,22 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn key_type_name(kt: cryptoki::object::KeyType) -> String {
+    use cryptoki::object::KeyType as KT;
+    match kt {
+        KT::RSA => "RSA".into(),
+        KT::EC => "EC (ECDSA/ECDH)".into(),
+        KT::EC_EDWARDS => "EC-Edwards (EdDSA)".into(),
+        KT::EC_MONTGOMERY => "EC-Montgomery (X25519)".into(),
+        KT::DSA => "DSA".into(),
+        KT::DH => "DH".into(),
+        KT::AES => "AES".into(),
+        KT::DES3 => "DES3".into(),
+        KT::GENERIC_SECRET => "Generic secret".into(),
+        _ => format!("unknown ({kt:?})"),
+    }
 }
 
 fn get_str_attr(
