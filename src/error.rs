@@ -11,7 +11,11 @@ pub enum Error {
     #[error("key not found: {0}")]
     KeyNotFound(String),
 
-    #[error("ambiguous key selection: {count} usable keys found; use --key-label, --key-id, or a PKCS#11 URI")]
+    #[error(
+        "ambiguous slot selection: {count} token slots found; \
+         use --key-uri with token=<label> to identify which token to authenticate against \
+         (e.g. pkcs11:token=my-softcard;object=my-key;type=private)"
+    )]
     AmbiguousKey { count: usize },
 
     #[error("unsupported key type on HSM: {0}")]

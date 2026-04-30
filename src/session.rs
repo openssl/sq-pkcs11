@@ -92,13 +92,14 @@ pub enum LoginMode<'a> {
 /// according to `login_mode`.
 ///
 /// Slot selection logic:
-///  - URI with a token label: find the slot whose CKA_TOKEN label matches.
-///  - Any other selector on a single initialised slot: use it directly.
-///  - Any other selector on multiple slots: error (be explicit).
-///
-/// Note: nShield in load-sharing mode exposes one virtual slot per OCS and
-/// one per softcard; `get_slots_with_initialized_token` will list all of them.
-/// Use a PKCS#11 URI with `token=<label>` to disambiguate.
+///  - URI with a token label: find the slot whose token label matches.
+///  - Any other selector with a single slot: use it directly.
+///  - Any other selector with multiple slots + no login needed: use the first
+///    slot.  With multiple HSM modules in one Security World every accelerator
+///    slot carries the same module-protected keys, so any slot is equivalent.
+///  - Any other selector with multiple slots + login required: error — the
+///    caller must provide a PKCS#11 URI with `token=<label>` to identify which
+///    token to authenticate against.
 pub fn open_session<'a>(
     pkcs11: &Pkcs11,
     selector: &KeySelector,
@@ -115,7 +116,15 @@ pub fn open_session<'a>(
             if slots.len() == 1 {
                 slots[0]
             } else {
-                return Err(Error::AmbiguousKey { count: slots.len() });
+                match login_mode {
+                    // Module-protected: all accelerator slots are equivalent,
+                    // use the first one.
+                    LoginMode::None => slots[0],
+                    // Login required: we must know which token to authenticate.
+                    _ => {
+                        return Err(Error::AmbiguousKey { count: slots.len() });
+                    }
+                }
             }
         }
     };
