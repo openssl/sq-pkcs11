@@ -112,7 +112,7 @@ fn find_companion_public_key(
         })
         .ok_or_else(|| Error::UnsupportedKeyType("private key has no CKA_ID".into()))?;
 
-    let mut candidates = session.find_objects(&[
+    let candidates = session.find_objects(&[
         Attribute::Class(ObjectClass::PUBLIC_KEY),
         Attribute::Id(id_attr),
     ])?;
