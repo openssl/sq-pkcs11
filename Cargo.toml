@@ -25,5 +25,8 @@ rpassword = "7"
 # Hex encoding for CKA_ID display/parsing
 hex = "0.4"
 
+# RFC 3339 / ISO 8601 timestamp parsing for --creation-time
+humantime = "2"
+
 # Direct symbol loading for nShield extension functions (C_LoginBegin/Next/End)
 libloading = "0.8"

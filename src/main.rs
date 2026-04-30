@@ -148,6 +148,16 @@ struct SignArgs {
     /// Produce binary signature instead of ASCII-armored.
     #[arg(long)]
     no_armor: bool,
+
+    /// Key creation time used to compute the OpenPGP fingerprint embedded in
+    /// the signature's issuer field (RFC 3339, e.g. 2026-04-30T16:29:30Z).
+    ///
+    /// Must match the value used during cert-export so verifiers can resolve
+    /// the issuer fingerprint to the distributed certificate.
+    /// Defaults to Unix epoch when omitted — use this default consistently
+    /// if you did not pass --creation-time during cert-export either.
+    #[arg(long, value_name = "TIMESTAMP")]
+    creation_time: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +180,16 @@ struct CertExportArgs {
     /// Write certificate to this path (default: stdout).
     #[arg(long, short = 'o', value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// Key creation time to embed in the certificate (RFC 3339,
+    /// e.g. 2026-04-30T16:29:30Z).
+    ///
+    /// The OpenPGP fingerprint is derived from key material + creation time,
+    /// so this value must be used consistently in every subsequent `sign`
+    /// invocation.  Defaults to Unix epoch when omitted, which is a stable
+    /// value that requires no coordination between cert-export and sign.
+    #[arg(long, value_name = "TIMESTAMP")]
+    creation_time: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +226,18 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Resolve the PKCS#11 module path from CLI arg → PKCS11_MODULE_PATH → SQ_PKCS11_MODULE.
+/// Parse an optional RFC 3339 timestamp, defaulting to Unix epoch.
+///
+/// Unix epoch as default means the fingerprint is stable across runs without
+/// requiring the user to remember and pass a specific timestamp.
+fn parse_creation_time(s: Option<&str>) -> anyhow::Result<std::time::SystemTime> {
+    match s {
+        None => Ok(std::time::SystemTime::UNIX_EPOCH),
+        Some(ts) => humantime::parse_rfc3339(ts)
+            .with_context(|| format!("invalid --creation-time {ts:?}; use RFC 3339, e.g. 2026-04-30T16:29:30Z")),
+    }
+}
+
 fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = from_cli {
         return Ok(p);
@@ -230,10 +261,12 @@ fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode(module);
+    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
 
     let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
     let priv_handle = session::resolve_single_key(&session, &selector)?;
-    let signer = Pkcs11Signer::new(session, priv_handle)?;
+    let mut signer = Pkcs11Signer::new(session, priv_handle)?;
+    signer.set_creation_time(creation_time)?;
 
     let data = std::fs::read(&args.file)
         .with_context(|| format!("reading {}", args.file.display()))?;
@@ -285,11 +318,13 @@ fn cmd_cert_export(
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode(module);
 
+    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+
     let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
     let priv_handle = session::resolve_single_key(&session, &selector)?;
     let mut signer = Pkcs11Signer::new(session, priv_handle)?;
 
-    let cert = cert::build_cert(&mut signer, &args.user_ids, None)?;
+    let cert = cert::build_cert(&mut signer, &args.user_ids, Some(creation_time))?;
     let armored = cert::export_armored_cert(&cert)?;
 
     match args.output {
