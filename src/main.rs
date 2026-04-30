@@ -23,13 +23,18 @@ use signer::Pkcs11Signer;
 #[derive(Parser)]
 #[command(name = "sq-pkcs11", version)]
 struct Cli {
-    /// Path to the PKCS#11 shared library.
+    /// Path to the PKCS#11 shared library (vendor module).
+    ///
+    /// May also be set via the PKCS11_MODULE_PATH environment variable
+    /// (standard, used by pkcs11-tool / p11-kit) or SQ_PKCS11_MODULE
+    /// (tool-specific fallback, checked when PKCS11_MODULE_PATH is unset).
     #[arg(
+        short = 'm',
         long,
-        env = "SQ_PKCS11_MODULE",
-        default_value = "/opt/nfast/toolkits/pkcs11/libcknfast.so"
+        env = "PKCS11_MODULE_PATH",
+        value_name = "PATH"
     )]
-    module: PathBuf,
+    module: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -188,16 +193,34 @@ struct ListKeysArgs {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let module = resolve_module(cli.module)?;
 
-    let pkcs11 = Pkcs11::new(&cli.module)
-        .with_context(|| format!("failed to load PKCS#11 module {}", cli.module.display()))?;
+    let pkcs11 = Pkcs11::new(&module)
+        .with_context(|| format!("failed to load PKCS#11 module {}", module.display()))?;
     pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
 
     match cli.command {
-        Command::Sign(args) => cmd_sign(&pkcs11, &cli.module, args),
-        Command::CertExport(args) => cmd_cert_export(&pkcs11, &cli.module, args),
+        Command::Sign(args) => cmd_sign(&pkcs11, &module, args),
+        Command::CertExport(args) => cmd_cert_export(&pkcs11, &module, args),
         Command::ListKeys(args) => cmd_list_keys(&pkcs11, args),
     }
+}
+
+/// Resolve the PKCS#11 module path from CLI arg → PKCS11_MODULE_PATH → SQ_PKCS11_MODULE.
+fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = from_cli {
+        return Ok(p);
+    }
+    // PKCS11_MODULE_PATH already handled by clap env; reaching here means it
+    // was unset. Check the tool-specific fallback variable.
+    if let Ok(val) = std::env::var("SQ_PKCS11_MODULE") {
+        return Ok(PathBuf::from(val));
+    }
+    anyhow::bail!(
+        "PKCS#11 module not specified.\n\
+         Use -m/--module <path>, or set PKCS11_MODULE_PATH or SQ_PKCS11_MODULE.\n\
+         Example: -m /opt/nfast/toolkits/pkcs11/libcknfast.so"
+    )
 }
 
 // ---------------------------------------------------------------------------
