@@ -1,0 +1,29 @@
+[package]
+name = "sq-pkcs11"
+version = "0.1.0"
+edition = "2024"
+description = "Sign OpenPGP release artifacts using keys stored on a PKCS#11 HSM"
+license = "Apache-2.0"
+
+[dependencies]
+# PKCS#11
+cryptoki = "0.12"
+
+# OpenPGP
+sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-openssl"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Secure passphrase prompting
+rpassword = "7"
+
+# Hex encoding for CKA_ID display/parsing
+hex = "0.4"
+
+# Direct symbol loading for nShield extension functions (C_LoginBegin/Next/End)
+libloading = "0.8"
