@@ -30,17 +30,27 @@ pub fn build_cert(
     let creation_time = creation_time.unwrap_or_else(std::time::SystemTime::now);
     let (flags, hash_algo) = key_flags_and_hash(signer.public_key().pk_algo());
 
-    // Stamp the cached public key with the real creation time.
-    let stamped_key = {
-        let raw = signer.public_key();
-        sequoia_openpgp::packet::Key::V4(
-            Key4::<PublicParts, PrimaryRole>::new(creation_time, raw.pk_algo(), raw.mpis().clone())?,
-        )
-    };
+    // Synchronise the signer's cached key creation time with the cert key.
+    //
+    // The OpenPGP fingerprint is derived from key material + creation time.
+    // Sequoia's pre_sign() embeds the signer's fingerprint as the issuer in
+    // every binding signature.  The cert key and the signer key must have the
+    // same creation time, otherwise the issuer fingerprint in the signatures
+    // won't match the cert key fingerprint and all bindings will be invalid.
+    signer.set_creation_time(creation_time)?;
 
     // Seed the Cert with just the primary public key.  Sequoia's canonicalization
     // will reject it until we add at least one self-signature below.
-    let cert = Cert::try_from(vec![Packet::PublicKey(stamped_key.into())])?;
+    let cert = Cert::try_from(vec![Packet::PublicKey(
+        sequoia_openpgp::packet::Key::V4(
+            Key4::<PublicParts, PrimaryRole>::new(
+                creation_time,
+                signer.public_key().pk_algo(),
+                signer.public_key().mpis().clone(),
+            )?,
+        )
+        .into(),
+    )])?;
 
     // Direct-key self-signature (key flags, preferred algorithms, etc.).
     let direct_sig = SignatureBuilder::new(SignatureType::DirectKey)

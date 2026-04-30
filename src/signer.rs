@@ -47,6 +47,23 @@ impl Pkcs11Signer {
     pub fn public_key(&self) -> &Key<PublicParts, UnspecifiedRole> {
         &self.public
     }
+
+    /// Stamp the cached public key with a specific creation time.
+    ///
+    /// The OpenPGP fingerprint is derived from the key material **and** the
+    /// creation time.  When building a certificate, the cert key and every
+    /// self-signature's issuer fingerprint must agree.  Call this before
+    /// `cert::build_cert` so the signer's fingerprint matches the stamped
+    /// key inserted into the certificate.
+    pub fn set_creation_time(&mut self, t: std::time::SystemTime) -> Result<()> {
+        let new_key = Key4::<PublicParts, PrimaryRole>::new(
+            t,
+            self.public.pk_algo(),
+            self.public.mpis().clone(),
+        )?;
+        self.public = sequoia_openpgp::packet::Key::V4(new_key.role_into_unspecified());
+        Ok(())
+    }
 }
 
 impl Signer for Pkcs11Signer {
