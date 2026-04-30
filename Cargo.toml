@@ -1,7 +1,7 @@
 [package]
 name = "sq-pkcs11"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "Sign OpenPGP release artifacts using keys stored on a PKCS#11 HSM"
 license = "Apache-2.0"
 
