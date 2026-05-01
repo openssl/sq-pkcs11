@@ -146,8 +146,9 @@ struct SignArgs {
     output: Option<PathBuf>,
 
     /// Produce binary signature instead of ASCII-armored.
+    /// (Default output is ASCII-armored, matching GnuPG and Sequoia conventions.)
     #[arg(long)]
-    no_armor: bool,
+    binary: bool,
 
     /// Key creation time used to compute the OpenPGP fingerprint embedded in
     /// the signature's issuer field (RFC 3339, e.g. 2026-04-30T16:29:30Z).
@@ -173,8 +174,8 @@ struct CertExportArgs {
     auth: AuthArgs,
 
     /// User ID to embed, e.g. "OpenSSL Release Key <openssl-security@openssl.org>".
-    /// Repeat to add multiple User IDs.
-    #[arg(long = "uid", value_name = "UID", required = true)]
+    /// Repeat to add multiple User IDs.  Matches `sq key generate --userid`.
+    #[arg(long = "userid", value_name = "USERID", required = true)]
     user_ids: Vec<String>,
 
     /// Write certificate to this path (default: stdout).
@@ -410,7 +411,7 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
     let mut sig_buf = Vec::new();
     {
         let sink = Message::new(&mut sig_buf);
-        let sink = if args.no_armor {
+        let sink = if args.binary {
             sink
         } else {
             Armorer::new(sink).build()?

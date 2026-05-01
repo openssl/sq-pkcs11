@@ -97,7 +97,7 @@ available in load-sharing or HSM Pool mode (use `preload` for those).
 ```sh
 ./sq-pkcs11 cert-export \
   --key-label my-signing-key \
-  --uid "OpenSSL Release Key <openssl-security@openssl.org>" \
+  --userid "OpenSSL Release Key <openssl-security@openssl.org>" \
   --creation-time 2026-05-01T00:00:00Z \
   --validity-period 5y \
   --output release.asc
@@ -119,7 +119,7 @@ protection for unattended use:
 ./sq-pkcs11 cert-export \
   --key-label  "openssl-release-primary"      --ocs \
   --subkey-label "openssl-release-sign-2026"  \
-  --uid "OpenSSL Release Key <openssl-security@openssl.org>" \
+  --userid "OpenSSL Release Key <openssl-security@openssl.org>" \
   --creation-time         2026-05-01T00:00:00Z --validity-period         10y \
   --subkey-creation-time  2026-05-01T00:00:00Z --subkey-validity-period  2y  \
   --output release.asc
@@ -178,7 +178,7 @@ the cert.
   openssl-3.6.0.tar.gz
 # writes openssl-3.6.0.tar.gz.asc
 
-./sq-pkcs11 sign --no-armor --output release.tar.gz.sig --key-label ... release.tar.gz
+./sq-pkcs11 sign --binary --output release.tar.gz.sig --key-label ... release.tar.gz
 ```
 
 Verify with GnuPG:
