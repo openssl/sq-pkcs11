@@ -455,9 +455,13 @@ fn two_tier_cert_export_and_subkey_sign() {
     let listing_s = String::from_utf8_lossy(&listing.stdout);
 
     // colon-format: "pub:..." lines for primary, "sub:..." for subkey.
-    // Capability flags in column 12 (index 11).  We expect:
-    //   primary: 'c' (cert) — possibly 'cC' if also a primary signing
-    //   subkey:  's' (sign)
+    // Capability flags in column 12 (index 11).
+    //
+    // GPG distinguishes per-key (lowercase) from cert-wide (uppercase)
+    // capabilities.  In a two-tier cert the primary's per-key flags are
+    // 'c' only, while the cert-wide flags include 'S' (the subkey can
+    // sign) and 'C' (some key can certify).  So we check **lowercase**
+    // 'c' on the primary and assert lowercase 's' is absent there.
     let pub_caps = listing_s
         .lines()
         .find(|l| l.starts_with("pub:"))
@@ -469,16 +473,17 @@ fn two_tier_cert_export_and_subkey_sign() {
         .and_then(|l| l.split(':').nth(11))
         .unwrap_or("");
     assert!(
-        pub_caps.contains('c') || pub_caps.contains('C'),
-        "expected primary to have certify capability, caps={pub_caps:?}"
+        pub_caps.contains('c'),
+        "expected primary to have per-key certify capability (lowercase 'c'), caps={pub_caps:?}"
     );
     assert!(
-        !pub_caps.contains('s') && !pub_caps.contains('S'),
-        "primary must not be signing-capable in two-tier cert, caps={pub_caps:?}"
+        !pub_caps.contains('s'),
+        "primary must not have per-key signing capability (lowercase 's') in two-tier cert, \
+         caps={pub_caps:?}"
     );
     assert!(
-        sub_caps.contains('s') || sub_caps.contains('S'),
-        "expected subkey to have signing capability, caps={sub_caps:?}"
+        sub_caps.contains('s'),
+        "expected subkey to have per-key signing capability (lowercase 's'), caps={sub_caps:?}"
     );
 
     // 3. Sign with the subkey and verify.
