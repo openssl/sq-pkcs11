@@ -54,7 +54,7 @@ type FnLoginEnd = unsafe extern "C" fn(
 ) -> CK_RV;
 
 /// Loaded handles to the three nShield quorum login functions.
-pub struct NfastQuorumLogin {
+pub struct NshieldQuorumLogin {
     // The Library must be kept alive for the function pointers to remain valid.
     _lib: Library,
     login_begin: FnLoginBegin,
@@ -62,7 +62,7 @@ pub struct NfastQuorumLogin {
     login_end: FnLoginEnd,
 }
 
-impl NfastQuorumLogin {
+impl NshieldQuorumLogin {
     /// Load the quorum login symbols from `module_path`.
     pub fn load(module_path: &Path) -> Result<Self> {
         // SAFETY: loading a shared library is inherently unsafe.
@@ -70,7 +70,7 @@ impl NfastQuorumLogin {
             .with_context(|| format!("loading nShield module {}", module_path.display()))?;
 
         // SAFETY: we store `_lib` in the struct, keeping the library loaded for
-        // as long as `NfastQuorumLogin` lives, so the function pointers remain valid.
+        // as long as `NshieldQuorumLogin` lives, so the function pointers remain valid.
         let login_begin: FnLoginBegin = unsafe {
             *lib.get::<FnLoginBegin>(b"C_LoginBegin\0")
                 .context("C_LoginBegin not found — is this an nShield PKCS#11 module?")?

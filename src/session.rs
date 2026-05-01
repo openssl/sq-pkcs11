@@ -186,7 +186,7 @@ pub fn open_session<'a>(
         }
 
         LoginMode::OcsQuorum { module_path } => {
-            let ext = crate::nfast::NfastQuorumLogin::load(module_path)?;
+            let ext = crate::nshield::NshieldQuorumLogin::load(module_path)?;
             ext.quorum_login(session.handle(), |card_n, k, n| {
                 let prompt = format!(
                     "Insert card {card_n} of {k} (K={k}/N={n}) and enter passphrase \
