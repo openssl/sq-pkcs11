@@ -73,7 +73,7 @@ impl Signer for Pkcs11Signer {
 
     fn sign(
         &mut self,
-        _hash_algo: HashAlgorithm,
+        hash_algo: HashAlgorithm,
         digest: &[u8],
     ) -> sequoia_openpgp::Result<mpi::Signature> {
         // Compute the mechanism inline — Mechanism<'_> contains raw pointers
@@ -89,13 +89,54 @@ impl Signer for Pkcs11Signer {
             }
         };
 
+        // CKM_RSA_PKCS expects a DER-encoded DigestInfo, not a raw hash.
+        // CKM_ECDSA takes the raw digest directly.
+        let signing_input: Vec<u8> = match self.key_type {
+            KeyType::RSA => {
+                let prefix = digest_info_prefix(hash_algo)?;
+                let mut buf = Vec::with_capacity(prefix.len() + digest.len());
+                buf.extend_from_slice(prefix);
+                buf.extend_from_slice(digest);
+                buf
+            }
+            _ => digest.to_vec(),
+        };
+
         let raw = self
             .session
-            .sign(&mechanism, self.priv_handle, digest)
+            .sign(&mechanism, self.priv_handle, &signing_input)
             .map_err(|e| anyhow::anyhow!("PKCS#11 C_Sign failed: {e}"))?;
 
         encode_signature(&self.public, &raw)
     }
+}
+
+/// DER-encoded DigestInfo prefix (everything before the actual hash bytes)
+/// for use with CKM_RSA_PKCS signing.
+///
+/// DigestInfo ::= SEQUENCE { digestAlgorithm AlgorithmIdentifier, digest OCTET STRING }
+fn digest_info_prefix(hash_algo: HashAlgorithm) -> sequoia_openpgp::Result<&'static [u8]> {
+    Ok(match hash_algo {
+        HashAlgorithm::SHA256 => &[
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+            0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+        ],
+        HashAlgorithm::SHA384 => &[
+            0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+            0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+        ],
+        HashAlgorithm::SHA512 => &[
+            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+            0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+        ],
+        other => {
+            return Err(sequoia_openpgp::Error::InvalidArgument(format!(
+                "RSA signing with hash algorithm {other:?} is not supported \
+                 (use SHA-256, SHA-384, or SHA-512)"
+            ))
+            .into())
+        }
+    })
 }
 
 /// Read public key material from the HSM and return a Sequoia Key packet.
