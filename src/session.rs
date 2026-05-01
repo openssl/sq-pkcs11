@@ -138,21 +138,42 @@ pub fn open_session<'a>(
 
     let slot = match selector {
         KeySelector::Uri(uri) => find_slot_by_uri(pkcs11, &slots, uri)?,
-        _ => {
-            if slots.len() == 1 {
-                slots[0]
-            } else {
-                match login_mode {
-                    // Module-protected: all accelerator slots are equivalent,
-                    // use the first one.
-                    LoginMode::None => slots[0],
-                    // Login required: we must know which token to authenticate.
-                    _ => {
-                        return Err(Error::AmbiguousKey { count: slots.len() });
+        _ => match login_mode {
+            // Module-protected: filter out token slots that require login
+            // (OCS / softcard).  All remaining accelerator-style slots carry
+            // the same module-protected keys, so any one works.
+            LoginMode::None => {
+                let no_login: Vec<Slot> = slots
+                    .iter()
+                    .filter(|&&s| {
+                        pkcs11
+                            .get_token_info(s)
+                            .map(|i| !i.login_required())
+                            .unwrap_or(false)
+                    })
+                    .copied()
+                    .collect();
+                match no_login.len() {
+                    0 => {
+                        return Err(Error::KeyNotFound(
+                            "no module-protected slots found; \
+                             use --key-uri to address a token slot directly"
+                                .into(),
+                        ))
                     }
+                    _ => no_login[0],
                 }
             }
-        }
+            // Login required: caller must disambiguate via PKCS#11 URI when
+            // multiple token slots are visible.
+            _ => {
+                if slots.len() == 1 {
+                    slots[0]
+                } else {
+                    return Err(Error::AmbiguousKey { count: slots.len() });
+                }
+            }
+        },
     };
 
     let session = pkcs11.open_ro_session(slot)?;

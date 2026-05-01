@@ -1,99 +1,159 @@
 use sequoia_openpgp::{
     Cert, Packet,
     packet::{
-        key::{Key4, PrimaryRole, PublicParts},
-        signature::SignatureBuilder,
         UserID,
+        key::{Key4, PrimaryRole, PublicParts, SubordinateRole},
+        signature::SignatureBuilder,
     },
     serialize::Serialize,
-    types::{HashAlgorithm, KeyFlags, PublicKeyAlgorithm, SignatureType},
+    types::{HashAlgorithm, KeyFlags, PublicKeyAlgorithm, SignatureType, SymmetricAlgorithm},
 };
 
 use crate::error::Result;
 use crate::signer::Pkcs11Signer;
 
-/// Build an OpenPGP certificate around an HSM-backed signer.
+/// Per-key inputs to the certificate builder.
+pub struct KeySpec<'a> {
+    pub signer: &'a mut Pkcs11Signer,
+    pub creation_time: std::time::SystemTime,
+    pub validity_period: Option<std::time::Duration>,
+}
+
+/// Full certificate description.
 ///
-/// The certificate contains:
-///   - A direct-key self-signature carrying key flags and preferred algorithms.
-///   - One positive-certification self-signature per User ID.
+/// When `subkey` is `None`, the resulting cert has a single primary key with
+/// both `Certify` and `Sign` capabilities.  When `subkey` is `Some`, the
+/// primary becomes `Certify`-only and the subkey carries the `Sign` flag.
+pub struct CertSpec<'a> {
+    pub primary: KeySpec<'a>,
+    pub subkey: Option<KeySpec<'a>>,
+    pub user_ids: &'a [String],
+}
+
+/// Build an OpenPGP certificate around HSM-backed signer(s).
 ///
-/// `creation_time` should reflect the key's actual creation time when known;
-/// pass `None` to use the current system time.
+/// Single-key cert (no subkey):
+/// 1. Direct-key self-sig over primary (flags = Certify + Sign)
+/// 2. Positive-certification self-sig per User ID
 ///
-/// `validity_period` controls when the key stops being able to make new
-/// signatures.  `Some(d)` sets the key to expire `d` after `creation_time`;
-/// `None` means the key never expires.
-pub fn build_cert(
-    signer: &mut Pkcs11Signer,
-    user_ids: &[String],
-    creation_time: Option<std::time::SystemTime>,
-    validity_period: Option<std::time::Duration>,
-) -> Result<Cert> {
+/// Two-tier cert (subkey present):
+/// 1. Direct-key self-sig over primary (flags = Certify only)
+/// 2. Positive-certification self-sig per User ID
+/// 3. Cross-sig: subkey signs (primary, subkey) as PrimaryKeyBinding
+/// 4. Subkey-binding: primary signs (primary, subkey) as SubkeyBinding,
+///    with the cross-sig embedded in the hashed area.
+pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
+    let CertSpec {
+        primary,
+        mut subkey,
+        user_ids,
+    } = spec;
+
     assert!(!user_ids.is_empty(), "at least one User ID is required");
 
-    let creation_time = creation_time.unwrap_or_else(std::time::SystemTime::now);
-    let (flags, hash_algo) = key_flags_and_hash(signer.public_key().pk_algo());
+    // Stamp creation times on the cached public keys so signature issuer
+    // fingerprints match the cert key fingerprints.
+    primary.signer.set_creation_time(primary.creation_time)?;
+    if let Some(sk) = subkey.as_mut() {
+        sk.signer.set_creation_time(sk.creation_time)?;
+    }
 
-    // Synchronise the signer's cached key creation time with the cert key.
-    //
-    // The OpenPGP fingerprint is derived from key material + creation time.
-    // Sequoia's pre_sign() embeds the signer's fingerprint as the issuer in
-    // every binding signature.  The cert key and the signer key must have the
-    // same creation time, otherwise the issuer fingerprint in the signatures
-    // won't match the cert key fingerprint and all bindings will be invalid.
-    signer.set_creation_time(creation_time)?;
+    let primary_hash = preferred_hash_for(primary.signer.public_key().pk_algo());
 
-    // Seed the Cert with just the primary public key.  Sequoia's canonicalization
-    // will reject it until we add at least one self-signature below.
-    let cert = Cert::try_from(vec![Packet::PublicKey(
-        sequoia_openpgp::packet::Key::V4(
-            Key4::<PublicParts, PrimaryRole>::new(
-                creation_time,
-                signer.public_key().pk_algo(),
-                signer.public_key().mpis().clone(),
-            )?,
-        )
-        .into(),
-    )])?;
+    // Build the primary public-key packet pinned to the requested creation time.
+    let primary_key = sequoia_openpgp::packet::Key::V4(
+        Key4::<PublicParts, PrimaryRole>::new(
+            primary.creation_time,
+            primary.signer.public_key().pk_algo(),
+            primary.signer.public_key().mpis().clone(),
+        )?,
+    );
 
-    // Direct-key self-signature (key flags, preferred algorithms, etc.).
+    // Seed Cert with the primary; canonicalisation tolerates the missing
+    // self-signature until we add it on the next step.
+    let cert = Cert::try_from(vec![Packet::PublicKey(primary_key.into())])?;
+
+    // -------- Direct-key self-signature on the primary --------
+    let primary_flags = if subkey.is_some() {
+        KeyFlags::empty().set_certification()
+    } else {
+        KeyFlags::empty().set_certification().set_signing()
+    };
     let direct_sig = SignatureBuilder::new(SignatureType::DirectKey)
-        .set_hash_algo(hash_algo)
-        .set_key_flags(flags)?
+        .set_hash_algo(primary_hash)
+        .set_key_flags(primary_flags)?
         .set_preferred_hash_algorithms(preferred_hashes())?
         .set_preferred_symmetric_algorithms(preferred_symmetric())?
-        .set_key_validity_period(validity_period)?
-        .sign_direct_key(signer, cert.primary_key().key())?;
+        .set_key_validity_period(primary.validity_period)?
+        .sign_direct_key(primary.signer, cert.primary_key().key())?;
 
     let (cert, _) = cert.insert_packets([Packet::from(direct_sig)])?;
 
-    // User ID binding signatures.
-    let mut packets: Vec<Packet> = Vec::with_capacity(user_ids.len() * 2);
+    // -------- User ID binding signatures --------
+    let mut uid_packets: Vec<Packet> = Vec::with_capacity(user_ids.len() * 2);
+    let mut first_uid = true;
     for raw_uid in user_ids {
         let uid = UserID::from(raw_uid.as_str());
-        let uid_sig = SignatureBuilder::new(SignatureType::PositiveCertification)
-            .set_hash_algo(hash_algo)
-            .set_primary_userid(true)?
-            .sign_userid_binding(signer, cert.primary_key().key(), &uid)?;
-        packets.push(uid.into());
-        packets.push(uid_sig.into());
+        let mut builder = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .set_hash_algo(primary_hash);
+        // Mark exactly the first UID as primary; Sequoia will warn if more
+        // than one UID claims primary status.
+        if first_uid {
+            builder = builder.set_primary_userid(true)?;
+            first_uid = false;
+        }
+        let uid_sig = builder.sign_userid_binding(
+            primary.signer,
+            cert.primary_key().key(),
+            &uid,
+        )?;
+        uid_packets.push(uid.into());
+        uid_packets.push(uid_sig.into());
     }
-    // After the first UID is marked primary above, clear the flag from others.
-    // (Sequoia's canonicalization will warn if multiple UIDs claim primary.)
-    // For simplicity we mark all UIDs as non-primary except the first; the
-    // loop above marks the first and we'd need to re-sign others without the
-    // flag — acceptable TODO for now since most certs have a single UID.
+    let (cert, _) = cert.insert_packets(uid_packets)?;
 
-    let (cert, _) = cert.insert_packets(packets)?;
+    // -------- Subkey, if any --------
+    let cert = if let Some(sk) = subkey {
+        let subkey_hash = preferred_hash_for(sk.signer.public_key().pk_algo());
+
+        let subkey_key = sequoia_openpgp::packet::Key::V4(
+            Key4::<PublicParts, SubordinateRole>::new(
+                sk.creation_time,
+                sk.signer.public_key().pk_algo(),
+                sk.signer.public_key().mpis().clone(),
+            )?,
+        );
+
+        // Cross-sig — subkey signer attests it consents to being bound.
+        // Required for any signing-capable subkey to prevent subkey hijacking.
+        let cross_sig = SignatureBuilder::new(SignatureType::PrimaryKeyBinding)
+            .set_hash_algo(subkey_hash)
+            .sign_primary_key_binding(sk.signer, cert.primary_key().key(), &subkey_key)?;
+
+        // Subkey binding — primary signs (primary, subkey), embedding cross-sig.
+        let binding_sig = SignatureBuilder::new(SignatureType::SubkeyBinding)
+            .set_hash_algo(primary_hash)
+            .set_key_flags(KeyFlags::empty().set_signing())?
+            .set_key_validity_period(sk.validity_period)?
+            .set_embedded_signature(cross_sig)?
+            .sign_subkey_binding(primary.signer, cert.primary_key().key(), &subkey_key)?;
+
+        let (cert, _) = cert.insert_packets([
+            Packet::PublicSubkey(subkey_key.into()),
+            Packet::from(binding_sig),
+        ])?;
+        cert
+    } else {
+        cert
+    };
 
     Ok(cert)
 }
 
-fn key_flags_and_hash(algo: PublicKeyAlgorithm) -> (KeyFlags, HashAlgorithm) {
+fn preferred_hash_for(algo: PublicKeyAlgorithm) -> HashAlgorithm {
     match algo {
-        PublicKeyAlgorithm::ECDSA => (KeyFlags::empty().set_signing(), HashAlgorithm::SHA384),
-        _ => (KeyFlags::empty().set_signing(), HashAlgorithm::SHA512),
+        PublicKeyAlgorithm::ECDSA => HashAlgorithm::SHA384,
+        _ => HashAlgorithm::SHA512,
     }
 }
 
@@ -105,8 +165,7 @@ fn preferred_hashes() -> Vec<HashAlgorithm> {
     ]
 }
 
-fn preferred_symmetric() -> Vec<sequoia_openpgp::types::SymmetricAlgorithm> {
-    use sequoia_openpgp::types::SymmetricAlgorithm;
+fn preferred_symmetric() -> Vec<SymmetricAlgorithm> {
     vec![SymmetricAlgorithm::AES256, SymmetricAlgorithm::AES128]
 }
 

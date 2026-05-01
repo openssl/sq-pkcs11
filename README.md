@@ -92,7 +92,7 @@ readers connected to the nShield host before running the command. The
 `--ocs` path uses nShield's vendor extension functions and is not
 available in load-sharing or HSM Pool mode (use `preload` for those).
 
-### Exporting an OpenPGP certificate
+### Exporting an OpenPGP certificate (single-key)
 
 ```sh
 ./sq-pkcs11 cert-export \
@@ -104,7 +104,59 @@ available in load-sharing or HSM Pool mode (use `preload` for those).
 ```
 
 Produces an OpenPGP public key block ready for distribution to keyservers
-and your project website. The `--uid` may be repeated.
+and your project website. The `--uid` may be repeated. The primary key
+carries both `Certify` and `Sign` capabilities; subsequent `sign`
+invocations use it directly.
+
+### Exporting a two-tier certificate (long-term primary + signing subkey)
+
+The recommended structure for release-signing infrastructure: a
+long-lived `Certify`-only primary key kept under strong protection
+(e.g. OCS quorum), and a shorter-lived `Sign` subkey under module
+protection for unattended use:
+
+```sh
+./sq-pkcs11 cert-export \
+  --key-label  "openssl-release-primary"      --ocs \
+  --subkey-label "openssl-release-sign-2026"  \
+  --uid "OpenSSL Release Key <openssl-security@openssl.org>" \
+  --creation-time         2026-05-01T00:00:00Z --validity-period         10y \
+  --subkey-creation-time  2026-05-01T00:00:00Z --subkey-validity-period  2y  \
+  --output release.asc
+```
+
+This is a one-off ceremony performed annually (or whenever the subkey
+is rotated). The operators load OCS cards, the tool prompts for the
+passphrases, and emits a single cert containing primary + subkey with
+the proper subkey-binding signature and cross-signature.
+
+Each tier authenticates independently:
+
+| Flag | Tier |
+|---|---|
+| `--pin` / `--ocs` | primary |
+| `--subkey-pin` / `--subkey-ocs` | subkey |
+
+Omitting both auth flags on a tier means the corresponding key is
+module-protected (no login required).
+
+For day-to-day signing, only the subkey is used and no auth is needed:
+
+```sh
+./sq-pkcs11 sign --key-label "openssl-release-sign-2026" openssl-3.6.0.tar.gz
+```
+
+`gpg --verify` walks the cert from the signature's issuer (the subkey)
+through the subkey-binding to the primary, and reports both
+fingerprints. `gpg -k` after import shows:
+
+```
+pub   rsa4096 2026-05-01 [C] [expires: 2036-05-01]
+      <PRIMARY FINGERPRINT>
+uid           [ unknown] OpenSSL Release Key <...>
+sub   rsa4096 2026-05-01 [S] [expires: 2028-05-01]
+      <SUBKEY FINGERPRINT>
+```
 
 `--validity-period` defaults to **5 years**. Format: integer + unit
 (`y` years, `w` weeks, `d` days, `h` hours). Years use the calendar

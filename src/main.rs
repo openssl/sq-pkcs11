@@ -207,6 +207,56 @@ struct CertExportArgs {
     /// expiration bounds the blast radius if the HSM is ever compromised.
     #[arg(long, group = "validity")]
     no_expiration: bool,
+
+    // ────────────────────────────────────────────────────────────────────
+    // Optional signing subkey.
+    //
+    // When a --subkey-* selector is present, the primary key becomes
+    // Certify-only and the subkey carries the Sign capability.  Each tier
+    // is authenticated independently — typically primary on OCS, subkey
+    // module-protected.
+    // ────────────────────────────────────────────────────────────────────
+    /// Subkey selector — PKCS#11 URI form.
+    #[arg(long, value_name = "URI", group = "subkey_selector")]
+    subkey_uri: Option<String>,
+
+    /// Subkey selector — by CKA_LABEL.
+    #[arg(long, value_name = "LABEL", group = "subkey_selector")]
+    subkey_label: Option<String>,
+
+    /// Subkey selector — by CKA_ID (hex).
+    #[arg(long, value_name = "HEX", group = "subkey_selector")]
+    subkey_id: Option<String>,
+
+    /// Subkey selector — auto-pick when exactly one usable subkey is visible.
+    #[arg(long, group = "subkey_selector")]
+    subkey_auto: bool,
+
+    /// PIN / passphrase for the subkey, if it is softcard- or single-card-OCS-protected.
+    #[arg(long, env = "SQ_PKCS11_SUBKEY_PIN", group = "subkey_auth", requires = "subkey_selector")]
+    subkey_pin: Option<String>,
+
+    /// Use nShield K/N quorum login for the subkey.
+    #[arg(long, group = "subkey_auth", requires = "subkey_selector")]
+    subkey_ocs: bool,
+
+    /// Subkey creation time (RFC 3339).  Same semantics as --creation-time.
+    #[arg(long, value_name = "TIMESTAMP", requires = "subkey_selector")]
+    subkey_creation_time: Option<String>,
+
+    /// Subkey validity period (default: 2y).  Same format as --validity-period.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "2y",
+        group = "subkey_validity",
+        requires = "subkey_selector"
+    )]
+    subkey_validity_period: String,
+
+    /// Issue the subkey with no expiration.
+    #[arg(long, group = "subkey_validity", requires = "subkey_selector")]
+    subkey_no_expiration: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +290,41 @@ fn main() -> anyhow::Result<()> {
         Command::Sign(args) => cmd_sign(&pkcs11, &module, args),
         Command::CertExport(args) => cmd_cert_export(&pkcs11, &module, args),
         Command::ListKeys(args) => cmd_list_keys(&pkcs11, args),
+    }
+}
+
+/// Resolve the subkey key selector from CLI args.
+///
+/// Returns `None` if no subkey selector was provided (single-key cert).
+fn resolve_subkey_selector(args: &CertExportArgs) -> anyhow::Result<Option<KeySelector>> {
+    if let Some(uri) = &args.subkey_uri {
+        return Ok(Some(KeySelector::Uri(uri.parse()?)));
+    }
+    if let Some(label) = &args.subkey_label {
+        return Ok(Some(KeySelector::Label(label.clone())));
+    }
+    if let Some(id_hex) = &args.subkey_id {
+        let bytes = hex::decode(id_hex)
+            .with_context(|| format!("invalid hex in --subkey-id: {id_hex}"))?;
+        return Ok(Some(KeySelector::Id(bytes)));
+    }
+    if args.subkey_auto {
+        return Ok(Some(KeySelector::Auto));
+    }
+    Ok(None)
+}
+
+/// Build a `LoginMode` for the subkey from --subkey-pin / --subkey-ocs.
+fn build_subkey_login<'a>(
+    args: &'a CertExportArgs,
+    module: &'a std::path::Path,
+) -> LoginMode<'a> {
+    if args.subkey_ocs {
+        return LoginMode::OcsQuorum { module_path: module };
+    }
+    match args.subkey_pin.as_deref() {
+        Some(pin) => LoginMode::Pin(pin),
+        None => LoginMode::None,
     }
 }
 
@@ -356,21 +441,65 @@ fn cmd_cert_export(
     module: &std::path::Path,
     args: CertExportArgs,
 ) -> anyhow::Result<()> {
-    let selector = args.key.resolve()?;
-    let login = args.auth.login_mode(module);
-
-    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
-    let validity = if args.no_expiration {
+    // ── Primary tier ─────────────────────────────────────────────────
+    let primary_selector = args.key.resolve()?;
+    let primary_login = args.auth.login_mode(module);
+    let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let primary_validity = if args.no_expiration {
         None
     } else {
         Some(parse_validity(&args.validity_period)?)
     };
 
-    let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
-    let priv_handle = session::resolve_single_key(&session, &selector)?;
-    let mut signer = Pkcs11Signer::new(session, priv_handle)?;
+    let (primary_session, _) =
+        session::open_session(pkcs11, &primary_selector, &primary_login)?;
+    let primary_handle = session::resolve_single_key(&primary_session, &primary_selector)?;
+    let mut primary_signer = Pkcs11Signer::new(primary_session, primary_handle)?;
 
-    let cert = cert::build_cert(&mut signer, &args.user_ids, Some(creation_time), validity)?;
+    // ── Optional subkey tier ─────────────────────────────────────────
+    let subkey_selector = resolve_subkey_selector(&args)?;
+    let mut subkey_signer_holder: Option<Pkcs11Signer> = None;
+    let subkey_creation_time;
+    let subkey_validity;
+
+    if let Some(sel) = &subkey_selector {
+        let subkey_login = build_subkey_login(&args, module);
+        subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
+        subkey_validity = if args.subkey_no_expiration {
+            None
+        } else {
+            Some(parse_validity(&args.subkey_validity_period)?)
+        };
+        let (sk_session, _) = session::open_session(pkcs11, sel, &subkey_login)?;
+        let sk_handle = session::resolve_single_key(&sk_session, sel)?;
+        subkey_signer_holder = Some(Pkcs11Signer::new(sk_session, sk_handle)?);
+    } else {
+        // Unused but the compiler requires they be initialised on all paths.
+        subkey_creation_time = std::time::SystemTime::UNIX_EPOCH;
+        subkey_validity = None;
+    }
+
+    // ── Assemble the cert spec and build ─────────────────────────────
+    let primary_spec = cert::KeySpec {
+        signer: &mut primary_signer,
+        creation_time: primary_creation_time,
+        validity_period: primary_validity,
+    };
+    let subkey_spec = subkey_signer_holder
+        .as_mut()
+        .map(|signer| cert::KeySpec {
+            signer,
+            creation_time: subkey_creation_time,
+            validity_period: subkey_validity,
+        });
+
+    let spec = cert::CertSpec {
+        primary: primary_spec,
+        subkey: subkey_spec,
+        user_ids: &args.user_ids,
+    };
+
+    let cert = cert::build_cert(spec)?;
     let armored = cert::export_armored_cert(&cert)?;
 
     match args.output {
