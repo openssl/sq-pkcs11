@@ -1,12 +1,13 @@
 use sequoia_openpgp::{
     Cert, Packet,
+    crypto::mpi,
     packet::{
-        UserID,
-        key::{Key4, PrimaryRole, PublicParts, SubordinateRole},
+        Key, UserID,
+        key::{Key4, PrimaryRole, PublicParts, SubordinateRole, UnspecifiedRole},
         signature::SignatureBuilder,
     },
     serialize::Serialize,
-    types::{HashAlgorithm, KeyFlags, PublicKeyAlgorithm, SignatureType, SymmetricAlgorithm},
+    types::{Curve, HashAlgorithm, KeyFlags, SignatureType, SymmetricAlgorithm},
 };
 
 use crate::error::Result;
@@ -58,7 +59,7 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
         sk.signer.set_creation_time(sk.creation_time)?;
     }
 
-    let primary_hash = preferred_hash_for(primary.signer.public_key().pk_algo());
+    let primary_hash = preferred_hash_for(primary.signer.public_key());
 
     // Build the primary public-key packet pinned to the requested creation time.
     let primary_key = sequoia_openpgp::packet::Key::V4(
@@ -114,7 +115,7 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
 
     // -------- Subkey, if any --------
     let cert = if let Some(sk) = subkey {
-        let subkey_hash = preferred_hash_for(sk.signer.public_key().pk_algo());
+        let subkey_hash = preferred_hash_for(sk.signer.public_key());
 
         let subkey_key = sequoia_openpgp::packet::Key::V4(
             Key4::<PublicParts, SubordinateRole>::new(
@@ -150,10 +151,25 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
     Ok(cert)
 }
 
-fn preferred_hash_for(algo: PublicKeyAlgorithm) -> HashAlgorithm {
-    match algo {
-        PublicKeyAlgorithm::ECDSA => HashAlgorithm::SHA384,
-        _ => HashAlgorithm::SHA512,
+/// Pick a hash algorithm whose strength matches the signing key.
+///
+/// For ECDSA the choice follows NIST SP 800-57: pair each curve with a hash
+/// of the corresponding security level (P-256↔SHA-256, P-384↔SHA-384,
+/// P-521↔SHA-512).  Strict FIPS-mode HSMs may reject mismatched pairs, and
+/// matched pairs avoid wasted hash work for shorter curves.
+///
+/// For RSA we default to SHA-512 — both well-supported and stronger than
+/// any RSA key size we accept.
+fn preferred_hash_for(public: &Key<PublicParts, UnspecifiedRole>) -> HashAlgorithm {
+    if let mpi::PublicKey::ECDSA { curve, .. } = public.mpis() {
+        match curve {
+            Curve::NistP256 => HashAlgorithm::SHA256,
+            Curve::NistP384 => HashAlgorithm::SHA384,
+            Curve::NistP521 => HashAlgorithm::SHA512,
+            _ => HashAlgorithm::SHA384, // any other curve we accept goes through P-384 hash
+        }
+    } else {
+        HashAlgorithm::SHA512
     }
 }
 

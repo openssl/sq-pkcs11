@@ -104,7 +104,7 @@ available in load-sharing or HSM Pool mode (use `preload` for those).
 ```
 
 Produces an OpenPGP public key block ready for distribution to keyservers
-and your project website. The `--uid` may be repeated. The primary key
+and your project website. The `--userid` may be repeated. The primary key
 carries both `Certify` and `Sign` capabilities; subsequent `sign`
 invocations use it directly.
 

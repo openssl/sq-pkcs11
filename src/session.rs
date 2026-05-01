@@ -118,14 +118,14 @@ pub enum LoginMode<'a> {
 /// according to `login_mode`.
 ///
 /// Slot selection logic:
-///  - URI with a token label: find the slot whose token label matches.
-///  - Any other selector with a single slot: use it directly.
-///  - Any other selector with multiple slots + no login needed: use the first
-///    slot.  With multiple HSM modules in one Security World every accelerator
-///    slot carries the same module-protected keys, so any slot is equivalent.
-///  - Any other selector with multiple slots + login required: error — the
-///    caller must provide a PKCS#11 URI with `token=<label>` to identify which
-///    token to authenticate against.
+///  - URI with a `token=` label → find the matching slot.
+///  - URI without `token=` (or any non-URI selector) → fall through to
+///    login-mode-aware selection.
+///  - LoginMode::None: pick any slot whose token does not require login
+///    (filters out OCS / softcard slots that may also be visible).
+///  - Login required: require a single visible slot; error if there are
+///    several, since the caller must specify which token to authenticate
+///    against — use `--key-uri pkcs11:token=<label>...` to disambiguate.
 pub fn open_session<'a>(
     pkcs11: &Pkcs11,
     selector: &KeySelector,
@@ -137,43 +137,12 @@ pub fn open_session<'a>(
     }
 
     let slot = match selector {
-        KeySelector::Uri(uri) => find_slot_by_uri(pkcs11, &slots, uri)?,
-        _ => match login_mode {
-            // Module-protected: filter out token slots that require login
-            // (OCS / softcard).  All remaining accelerator-style slots carry
-            // the same module-protected keys, so any one works.
-            LoginMode::None => {
-                let no_login: Vec<Slot> = slots
-                    .iter()
-                    .filter(|&&s| {
-                        pkcs11
-                            .get_token_info(s)
-                            .map(|i| !i.login_required())
-                            .unwrap_or(false)
-                    })
-                    .copied()
-                    .collect();
-                match no_login.len() {
-                    0 => {
-                        return Err(Error::KeyNotFound(
-                            "no module-protected slots found; \
-                             use --key-uri to address a token slot directly"
-                                .into(),
-                        ))
-                    }
-                    _ => no_login[0],
-                }
-            }
-            // Login required: caller must disambiguate via PKCS#11 URI when
-            // multiple token slots are visible.
-            _ => {
-                if slots.len() == 1 {
-                    slots[0]
-                } else {
-                    return Err(Error::AmbiguousKey { count: slots.len() });
-                }
-            }
-        },
+        KeySelector::Uri(uri) if uri.token_label.is_some() => {
+            find_slot_by_uri(pkcs11, &slots, uri)?
+        }
+        // Any other case (non-URI selectors, or URI without `token=`) shares
+        // the login-mode-aware selection path.
+        _ => smart_slot_selection(pkcs11, &slots, login_mode)?,
     };
 
     let session = pkcs11.open_ro_session(slot)?;
@@ -265,27 +234,70 @@ pub fn key_type(session: &Session, handle: ObjectHandle) -> Result<KeyType> {
 }
 
 fn find_slot_by_uri(pkcs11: &Pkcs11, slots: &[Slot], uri: &Pkcs11Uri) -> Result<Slot> {
+    let label = uri
+        .token_label
+        .as_deref()
+        .expect("caller guarantees uri.token_label is set");
     let matching: Vec<Slot> = slots
         .iter()
         .filter(|&&slot| {
-            if let Some(label) = &uri.token_label {
-                if let Ok(info) = pkcs11.get_token_info(slot) {
-                    return info.label().trim() == label.trim();
-                }
-                return false;
-            }
-            true
+            pkcs11
+                .get_token_info(slot)
+                .map(|i| i.label().trim() == label.trim())
+                .unwrap_or(false)
         })
         .copied()
         .collect();
 
     match matching.len() {
         0 => Err(Error::KeyNotFound(format!(
-            "no token matched label {:?}",
-            uri.token_label
+            "no token matched label {label:?}",
         ))),
         1 => Ok(matching[0]),
         n => Err(Error::AmbiguousKey { count: n }),
+    }
+}
+
+/// Login-mode-aware slot picker used when the selector doesn't pin a token.
+fn smart_slot_selection(
+    pkcs11: &Pkcs11,
+    slots: &[Slot],
+    login_mode: &LoginMode<'_>,
+) -> Result<Slot> {
+    match login_mode {
+        // Module-protected: filter out token slots that require login (OCS /
+        // softcard). All remaining accelerator-style slots carry the same
+        // module-protected keys, so any one works.
+        LoginMode::None => {
+            let no_login: Vec<Slot> = slots
+                .iter()
+                .filter(|&&s| {
+                    pkcs11
+                        .get_token_info(s)
+                        .map(|i| !i.login_required())
+                        .unwrap_or(false)
+                })
+                .copied()
+                .collect();
+            if no_login.is_empty() {
+                Err(Error::KeyNotFound(
+                    "no module-protected slots found; \
+                     use --key-uri pkcs11:token=<label>... to address a token slot directly"
+                        .into(),
+                ))
+            } else {
+                Ok(no_login[0])
+            }
+        }
+        // Login required: caller must disambiguate via a PKCS#11 URI with
+        // token=<label> when multiple token slots are visible.
+        _ => {
+            if slots.len() == 1 {
+                Ok(slots[0])
+            } else {
+                Err(Error::AmbiguousKey { count: slots.len() })
+            }
+        }
     }
 }
 

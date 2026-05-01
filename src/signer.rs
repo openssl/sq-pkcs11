@@ -287,14 +287,57 @@ fn oid_to_curve(der: &[u8]) -> Result<Curve> {
 }
 
 /// CKA_EC_POINT is DER: OCTET STRING (0x04) wrapping the raw EC point.
+///
+/// Handles both DER short-form length (single byte, value < 128) and
+/// long-form length (0x80 | n, then n length bytes big-endian).  P-521
+/// uncompressed points are 133 bytes and require long-form, encoded as
+/// `0x04 0x81 0x85 …`.
 fn unwrap_octet_string(der: &[u8]) -> Result<Vec<u8>> {
-    match der {
-        [0x04, len, rest @ ..] if rest.len() >= *len as usize => {
-            Ok(rest[..*len as usize].to_vec())
+    let after_tag = match der.split_first() {
+        Some((&0x04, rest)) => rest,
+        _ => {
+            return Err(Error::UnsupportedKeyType(
+                "CKA_EC_POINT is not a DER OCTET STRING".into(),
+            ));
         }
-        _ => Err(Error::UnsupportedKeyType(
-            "CKA_EC_POINT is not a DER OCTET STRING".into(),
-        )),
+    };
+    let (len, body) = parse_der_length(after_tag)?;
+    if body.len() < len {
+        return Err(Error::UnsupportedKeyType(
+            "CKA_EC_POINT length exceeds buffer".into(),
+        ));
+    }
+    Ok(body[..len].to_vec())
+}
+
+/// Parse an ASN.1 DER length octet sequence.
+///
+/// Returns (length value, slice positioned just after the length octets).
+fn parse_der_length(b: &[u8]) -> Result<(usize, &[u8])> {
+    let (&first, rest) = b
+        .split_first()
+        .ok_or_else(|| Error::UnsupportedKeyType("DER length missing".into()))?;
+    if first & 0x80 == 0 {
+        // Short form: length is the byte itself.
+        Ok((first as usize, rest))
+    } else {
+        // Long form: low 7 bits = number of length bytes that follow.
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > std::mem::size_of::<usize>() {
+            return Err(Error::UnsupportedKeyType(format!(
+                "DER long-form length count {n} unsupported"
+            )));
+        }
+        if rest.len() < n {
+            return Err(Error::UnsupportedKeyType(
+                "DER long-form length truncated".into(),
+            ));
+        }
+        let mut len = 0usize;
+        for &byte in &rest[..n] {
+            len = (len << 8) | byte as usize;
+        }
+        Ok((len, &rest[n..]))
     }
 }
 
@@ -421,6 +464,36 @@ mod tests {
         let mut der = vec![0x04, 0x61];
         der.extend(&payload);
         assert_eq!(unwrap_octet_string(&der).unwrap(), payload);
+    }
+
+    #[test]
+    fn unwrap_octet_string_p521_long_form_length() {
+        // P-521 uncompressed point is 133 bytes (0x04 || x[66] || y[66]).
+        // 133 ≥ 128 → DER long-form length: 0x81 0x85 (one length byte = 133).
+        let mut payload = vec![0x04];
+        payload.extend(vec![0xaa; 66]);
+        payload.extend(vec![0xbb; 66]);
+        assert_eq!(payload.len(), 133);
+
+        let mut der = vec![0x04, 0x81, 0x85];
+        der.extend(&payload);
+        assert_eq!(unwrap_octet_string(&der).unwrap(), payload);
+    }
+
+    #[test]
+    fn unwrap_octet_string_long_form_two_byte_length() {
+        // Synthetic 300-byte payload to exercise 0x82 NN MM long-form length.
+        let payload: Vec<u8> = (0..300).map(|i| (i & 0xff) as u8).collect();
+        let mut der = vec![0x04, 0x82, 0x01, 0x2c]; // 0x012c = 300
+        der.extend(&payload);
+        assert_eq!(unwrap_octet_string(&der).unwrap(), payload);
+    }
+
+    #[test]
+    fn unwrap_octet_string_long_form_truncated_rejected() {
+        // 0x81 says "1 length byte follows", but no bytes follow.
+        let der = &[0x04, 0x81];
+        assert!(unwrap_octet_string(der).is_err());
     }
 
     // -------------------------------------------------------------------
