@@ -37,11 +37,13 @@ impl std::str::FromStr for Pkcs11Uri {
         let mut uri = Pkcs11Uri::default();
         for part in s.split(';') {
             if let Some((k, v)) = part.split_once('=') {
-                let v = percent_decode(v);
                 match k {
-                    "token" => uri.token_label = Some(v),
-                    "object" => uri.object_label = Some(v),
-                    "id" => uri.key_id = Some(parse_id_bytes(&v)?),
+                    "token" => uri.token_label = Some(percent_decode(v)),
+                    "object" => uri.object_label = Some(percent_decode(v)),
+                    // Pass the raw value; parse_id_bytes disambiguates between
+                    // RFC 7512 percent-encoding and a hex shortcut by checking
+                    // for '%' itself.  Decoding here would erase that signal.
+                    "id" => uri.key_id = Some(parse_id_bytes(v)?),
                     _ => {}
                 }
             }
@@ -69,10 +71,34 @@ fn percent_decode(s: &str) -> String {
 
 fn parse_id_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
     if s.contains('%') {
-        Ok(percent_decode(s).bytes().collect())
+        Ok(percent_decode_bytes(s))
     } else {
         hex::decode(s).map_err(|e| anyhow::anyhow!("invalid key id hex: {e}"))
     }
+}
+
+/// Percent-decode directly to bytes (no UTF-8 round-trip).
+///
+/// Required for the `id` URI attribute because CKA_ID is binary; routing it
+/// through `String` would re-encode bytes ≥ 0x80 as multi-byte UTF-8.
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// How to authenticate the session once it is open.
@@ -239,5 +265,84 @@ fn find_slot_by_uri(pkcs11: &Pkcs11, slots: &[Slot], uri: &Pkcs11Uri) -> Result<
         ))),
         1 => Ok(matching[0]),
         n => Err(Error::AmbiguousKey { count: n }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_full() {
+        let uri: Pkcs11Uri = "pkcs11:token=mytoken;object=mykey;type=private"
+            .parse()
+            .unwrap();
+        assert_eq!(uri.token_label.as_deref(), Some("mytoken"));
+        assert_eq!(uri.object_label.as_deref(), Some("mykey"));
+        assert!(uri.key_id.is_none());
+    }
+
+    #[test]
+    fn uri_token_only() {
+        let uri: Pkcs11Uri = "pkcs11:token=t".parse().unwrap();
+        assert_eq!(uri.token_label.as_deref(), Some("t"));
+        assert_eq!(uri.object_label, None);
+        assert_eq!(uri.key_id, None);
+    }
+
+    #[test]
+    fn uri_object_only() {
+        let uri: Pkcs11Uri = "pkcs11:object=k".parse().unwrap();
+        assert_eq!(uri.token_label, None);
+        assert_eq!(uri.object_label.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn uri_no_prefix_rejected() {
+        let res: std::result::Result<Pkcs11Uri, _> = "token=foo".parse();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn uri_id_hex() {
+        let uri: Pkcs11Uri = "pkcs11:id=01ab02".parse().unwrap();
+        assert_eq!(uri.key_id.unwrap(), vec![0x01, 0xab, 0x02]);
+    }
+
+    #[test]
+    fn uri_id_percent_encoded() {
+        let uri: Pkcs11Uri = "pkcs11:id=%01%ab%02".parse().unwrap();
+        assert_eq!(uri.key_id.unwrap(), vec![0x01, 0xab, 0x02]);
+    }
+
+    #[test]
+    fn uri_id_percent_encoded_high_bytes_dont_utf8_expand() {
+        // Regression: previously we routed percent-decoded id bytes through
+        // String, so 0xAB (a single byte) became 0xC2 0xAB (UTF-8 of U+00AB).
+        let uri: Pkcs11Uri = "pkcs11:id=%80%ff%c0".parse().unwrap();
+        assert_eq!(uri.key_id.unwrap(), vec![0x80, 0xff, 0xc0]);
+    }
+
+    #[test]
+    fn uri_percent_encoded_label() {
+        let uri: Pkcs11Uri = "pkcs11:object=my%20key".parse().unwrap();
+        assert_eq!(uri.object_label.as_deref(), Some("my key"));
+    }
+
+    #[test]
+    fn uri_unknown_attribute_ignored() {
+        // RFC 7512 defines several attributes (slot-id, type, ...) we don't
+        // act on; they must be parsed and discarded without error.
+        let uri: Pkcs11Uri = "pkcs11:slot-id=1;token=t;type=private".parse().unwrap();
+        assert_eq!(uri.token_label.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn uri_empty_after_prefix() {
+        // No attributes at all — must parse to an empty Pkcs11Uri.
+        let uri: Pkcs11Uri = "pkcs11:".parse().unwrap();
+        assert!(uri.token_label.is_none());
+        assert!(uri.object_label.is_none());
+        assert!(uri.key_id.is_none());
     }
 }

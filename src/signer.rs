@@ -321,3 +321,232 @@ fn encode_signature(
         .into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // oid_to_curve
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn oid_to_curve_p256() {
+        // 1.2.840.10045.3.1.7
+        let der = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+        assert!(matches!(oid_to_curve(der).unwrap(), Curve::NistP256));
+    }
+
+    #[test]
+    fn oid_to_curve_p384() {
+        // 1.3.132.0.34
+        let der = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22];
+        assert!(matches!(oid_to_curve(der).unwrap(), Curve::NistP384));
+    }
+
+    #[test]
+    fn oid_to_curve_p521() {
+        // 1.3.132.0.35
+        let der = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23];
+        assert!(matches!(oid_to_curve(der).unwrap(), Curve::NistP521));
+    }
+
+    #[test]
+    fn oid_to_curve_unsupported_curve() {
+        // 1.2.840.10045.3.1.1 (P-192) — valid OID, unsupported curve
+        let der = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x01];
+        assert!(oid_to_curve(der).is_err());
+    }
+
+    #[test]
+    fn oid_to_curve_wrong_tag() {
+        // OCTET STRING (0x04) instead of OID (0x06)
+        let der = &[0x04, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22];
+        assert!(oid_to_curve(der).is_err());
+    }
+
+    #[test]
+    fn oid_to_curve_truncated() {
+        // Length byte says 8 but only 2 bytes follow
+        let der = &[0x06, 0x08, 0x2a, 0x86];
+        assert!(oid_to_curve(der).is_err());
+    }
+
+    #[test]
+    fn oid_to_curve_empty() {
+        assert!(oid_to_curve(&[]).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // unwrap_octet_string
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn unwrap_octet_string_valid() {
+        let der = &[0x04, 0x03, 0xaa, 0xbb, 0xcc];
+        assert_eq!(unwrap_octet_string(der).unwrap(), vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn unwrap_octet_string_empty_payload() {
+        let der = &[0x04, 0x00];
+        assert_eq!(unwrap_octet_string(der).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn unwrap_octet_string_wrong_tag() {
+        // OID tag instead of OCTET STRING
+        let der = &[0x06, 0x03, 0xaa, 0xbb, 0xcc];
+        assert!(unwrap_octet_string(der).is_err());
+    }
+
+    #[test]
+    fn unwrap_octet_string_truncated() {
+        // Length byte says 5 but only 2 bytes follow
+        let der = &[0x04, 0x05, 0xaa, 0xbb];
+        assert!(unwrap_octet_string(der).is_err());
+    }
+
+    #[test]
+    fn unwrap_octet_string_p384_point_shape() {
+        // CKA_EC_POINT for a P-384 key wraps a 97-byte uncompressed point
+        // (0x04 || x[48] || y[48]).  Encoded length is 97 = 0x61, but DER
+        // requires multi-byte length form for values ≥ 128 — for 97 the
+        // short form is fine: 0x04 0x61 <97 bytes>.
+        let mut payload = vec![0x04];
+        payload.extend(vec![0xaa; 48]);
+        payload.extend(vec![0xbb; 48]);
+        assert_eq!(payload.len(), 97);
+
+        let mut der = vec![0x04, 0x61];
+        der.extend(&payload);
+        assert_eq!(unwrap_octet_string(&der).unwrap(), payload);
+    }
+
+    // -------------------------------------------------------------------
+    // digest_info_prefix
+    //
+    // Reference values from RFC 8017 §9.2 (PKCS #1 v2.2).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn digest_info_prefix_sha256() {
+        let prefix = digest_info_prefix(HashAlgorithm::SHA256).unwrap();
+        assert_eq!(
+            prefix,
+            &[
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+            ]
+        );
+        // Trailing length byte must equal SHA-256 output size in bytes.
+        assert_eq!(*prefix.last().unwrap(), 32);
+    }
+
+    #[test]
+    fn digest_info_prefix_sha384() {
+        let prefix = digest_info_prefix(HashAlgorithm::SHA384).unwrap();
+        assert_eq!(
+            prefix,
+            &[
+                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+            ]
+        );
+        assert_eq!(*prefix.last().unwrap(), 48);
+    }
+
+    #[test]
+    fn digest_info_prefix_sha512() {
+        let prefix = digest_info_prefix(HashAlgorithm::SHA512).unwrap();
+        assert_eq!(
+            prefix,
+            &[
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+            ]
+        );
+        assert_eq!(*prefix.last().unwrap(), 64);
+    }
+
+    #[test]
+    fn digest_info_prefix_rejects_sha1() {
+        assert!(digest_info_prefix(HashAlgorithm::SHA1).is_err());
+    }
+
+    #[test]
+    fn digest_info_prefix_rejects_md5() {
+        assert!(digest_info_prefix(HashAlgorithm::MD5).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // encode_signature
+    //
+    // Constructs synthetic public keys with arbitrary MPI material — we
+    // are testing the signature splitting/MPI encoding, not cryptographic
+    // validity.
+    // -------------------------------------------------------------------
+
+    fn rsa_test_key() -> Key<PublicParts, UnspecifiedRole> {
+        let n = mpi::MPI::new(&[0xff; 256]); // 2048-bit-shaped value
+        let e = mpi::MPI::new(&[0x01, 0x00, 0x01]); // 65537
+        let key = Key4::<PublicParts, PrimaryRole>::new(
+            std::time::SystemTime::UNIX_EPOCH,
+            PublicKeyAlgorithm::RSAEncryptSign,
+            mpi::PublicKey::RSA { e, n },
+        )
+        .unwrap();
+        sequoia_openpgp::packet::Key::V4(key.role_into_unspecified())
+    }
+
+    fn ecdsa_p384_test_key() -> Key<PublicParts, UnspecifiedRole> {
+        // 0x04 || x[48] || y[48] = 97 bytes, leading bytes non-zero so the
+        // MPI representation matches what we put in.
+        let mut q_bytes = vec![0x04];
+        q_bytes.extend(vec![0xaa; 48]);
+        q_bytes.extend(vec![0xbb; 48]);
+        let q = mpi::MPI::new(&q_bytes);
+        let key = Key4::<PublicParts, PrimaryRole>::new(
+            std::time::SystemTime::UNIX_EPOCH,
+            PublicKeyAlgorithm::ECDSA,
+            mpi::PublicKey::ECDSA {
+                curve: Curve::NistP384,
+                q,
+            },
+        )
+        .unwrap();
+        sequoia_openpgp::packet::Key::V4(key.role_into_unspecified())
+    }
+
+    #[test]
+    fn encode_signature_rsa_passthrough() {
+        let key = rsa_test_key();
+        let raw = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+        let sig = encode_signature(&key, &raw).unwrap();
+        match sig {
+            mpi::Signature::RSA { s } => assert_eq!(s.value(), raw.as_slice()),
+            _ => panic!("expected RSA signature"),
+        }
+    }
+
+    #[test]
+    fn encode_signature_ecdsa_splits_in_half() {
+        // P-384: 96 bytes total, r and s are each 48 bytes.
+        // Use leading-non-zero bytes so MPI doesn't trim.
+        let r_bytes = [0x11u8; 48];
+        let s_bytes = [0x22u8; 48];
+        let mut raw = Vec::with_capacity(96);
+        raw.extend_from_slice(&r_bytes);
+        raw.extend_from_slice(&s_bytes);
+
+        let key = ecdsa_p384_test_key();
+        let sig = encode_signature(&key, &raw).unwrap();
+        match sig {
+            mpi::Signature::ECDSA { r, s } => {
+                assert_eq!(r.value(), r_bytes.as_slice());
+                assert_eq!(s.value(), s_bytes.as_slice());
+            }
+            _ => panic!("expected ECDSA signature"),
+        }
+    }
+}

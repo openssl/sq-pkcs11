@@ -461,3 +461,38 @@ fn get_str_attr(
             _ => None,
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creation_time_default_is_epoch() {
+        assert_eq!(
+            parse_creation_time(None).unwrap(),
+            std::time::SystemTime::UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn creation_time_rfc3339_round_trip() {
+        let t = parse_creation_time(Some("2026-04-30T16:29:30Z")).unwrap();
+        let expected = humantime::parse_rfc3339("2026-04-30T16:29:30Z").unwrap();
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn creation_time_garbage_rejected() {
+        assert!(parse_creation_time(Some("not a date")).is_err());
+        assert!(parse_creation_time(Some("")).is_err());
+    }
+
+    #[test]
+    fn creation_time_requires_timezone() {
+        // RFC 3339 requires an explicit timezone.  A bare datetime without 'Z'
+        // or an offset is ambiguous and must be rejected so users don't
+        // accidentally embed a localtime-interpreted timestamp in a published
+        // certificate.
+        assert!(parse_creation_time(Some("2026-04-30T16:29:30")).is_err());
+    }
+}
