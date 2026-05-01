@@ -1,0 +1,526 @@
+//! Integration tests for Entrust nShield (Security World, FIPS 140-3 mode).
+//!
+//! NSHIELD-SPECIFIC: these tests assume the nShield client tooling
+//! (`generatekey`, `nfkminfo`, `gpg`) is available, that `PKCS11_MODULE_PATH`
+//! points at `libcknfast.so`, and that the test keys exist (see
+//! `tests/nshield/README.md` for provisioning).
+//!
+//! All tests skip silently when `tests/nshield/test.env` is absent or
+//! incomplete, so this file is safe to compile and run on a developer
+//! machine without an HSM.
+
+use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
+use std::sync::Once;
+
+use assert_cmd::Command;
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Test environment loading.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct TestEnv {
+    module_path: String,
+    rsa_label: String,
+    ec_label: String,
+    primary_label: String,
+    subkey_label: String,
+}
+
+/// Load `tests/nshield/test.env` into the process environment exactly once,
+/// then read the labels we need.  Returns `None` if the file is missing or
+/// any required variable is unset — the calling test will print a skip
+/// message and return.
+fn test_env() -> Option<TestEnv> {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let env_file: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "nshield", "test.env"]
+            .iter()
+            .collect();
+        let _ = dotenvy::from_path(&env_file);
+    });
+
+    Some(TestEnv {
+        module_path: std::env::var("PKCS11_MODULE_PATH").ok()?,
+        rsa_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_RSA").ok()?,
+        ec_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_EC").ok()?,
+        primary_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_PRIMARY").ok()?,
+        subkey_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_SUBKEY").ok()?,
+    })
+}
+
+/// Macro to bail out cleanly when the env isn't available.
+macro_rules! require_env {
+    () => {
+        match test_env() {
+            Some(e) => e,
+            None => {
+                eprintln!(
+                    "skipping: tests/nshield/test.env not present or incomplete \
+                     — see tests/nshield/README.md"
+                );
+                return;
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Command helpers.
+// ---------------------------------------------------------------------------
+
+/// `sq-pkcs11` binary invocation with `PKCS11_MODULE_PATH` propagated.
+fn sq_pkcs11(env: &TestEnv) -> Command {
+    let mut c = Command::cargo_bin("sq-pkcs11").unwrap();
+    c.env("PKCS11_MODULE_PATH", &env.module_path);
+    // We never want our binary to inherit a SQ_PKCS11_PIN from the test
+    // shell — every test is supposed to use module-protected keys.
+    c.env_remove("SQ_PKCS11_PIN");
+    c.env_remove("SQ_PKCS11_SUBKEY_PIN");
+    c
+}
+
+/// `gpg` invocation pointed at an isolated keyring directory so tests don't
+/// touch the operator's real keyring.
+fn gpg_in(home: &Path) -> StdCommand {
+    let mut c = StdCommand::new("gpg");
+    c.env("GNUPGHOME", home);
+    // Disable any TTY interaction; keyring import / verify must be unattended.
+    c.env("GPG_TTY", "");
+    c.arg("--batch").arg("--no-tty");
+    c
+}
+
+/// Set up a fresh GPG home directory inside `tmp` and return its path.
+fn fresh_gpg_home(tmp: &TempDir) -> PathBuf {
+    let home = tmp.path().join("gnupg");
+    std::fs::create_dir_all(&home).unwrap();
+    // GPG insists on tight permissions for GNUPGHOME on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&home, perms).unwrap();
+    }
+    home
+}
+
+/// Stable creation time used across tests so fingerprints are reproducible
+/// from one test session to the next.
+const STABLE_TIME: &str = "2026-01-01T00:00:00Z";
+
+// ---------------------------------------------------------------------------
+// list-keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_keys_shows_test_keys() {
+    let env = require_env!();
+
+    let assert = sq_pkcs11(&env).arg("list-keys").assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    for label in [
+        &env.rsa_label,
+        &env.ec_label,
+        &env.primary_label,
+        &env.subkey_label,
+    ] {
+        assert!(
+            stdout.contains(label.as_str()),
+            "expected list-keys output to mention {label:?}, got:\n{stdout}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cert-export
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cert_export_rsa_produces_armored_block() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("rsa.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--userid", "Test RSA <rsa@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    let cert = std::fs::read_to_string(&cert_path).unwrap();
+    assert!(cert.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+    assert!(cert.contains("-----END PGP PUBLIC KEY BLOCK-----"));
+}
+
+#[test]
+fn cert_export_ec_produces_armored_block() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("ec.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--userid", "Test EC <ec@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    let cert = std::fs::read_to_string(&cert_path).unwrap();
+    assert!(cert.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+}
+
+// ---------------------------------------------------------------------------
+// Sign + verify round-trip
+// ---------------------------------------------------------------------------
+
+fn sign_verify_roundtrip(env: &TestEnv, key_label: &str, userid: &str) {
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let payload = tmp.path().join("payload.txt");
+    let signature = tmp.path().join("payload.txt.asc");
+    let gpg_home = fresh_gpg_home(&tmp);
+
+    std::fs::write(&payload, b"test payload bytes\n").unwrap();
+
+    // 1. Export the cert.
+    sq_pkcs11(env)
+        .args(["cert-export"])
+        .args(["--key-label", key_label])
+        .args(["--userid", userid])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    // 2. Import into the isolated GPG keyring.
+    let import = gpg_in(&gpg_home)
+        .arg("--import")
+        .arg(&cert_path)
+        .output()
+        .expect("gpg --import");
+    assert!(
+        import.status.success(),
+        "gpg --import failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&import.stdout),
+        String::from_utf8_lossy(&import.stderr),
+    );
+
+    // 3. Produce a detached signature.
+    sq_pkcs11(env)
+        .args(["sign"])
+        .args(["--key-label", key_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload)
+        .assert()
+        .success();
+    assert!(signature.exists(), "sign did not create {signature:?}");
+
+    // 4. Verify.
+    let verify = gpg_in(&gpg_home)
+        .arg("--verify")
+        .arg(&signature)
+        .arg(&payload)
+        .output()
+        .expect("gpg --verify");
+    assert!(
+        verify.status.success(),
+        "gpg --verify failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        stderr.contains("Good signature"),
+        "expected 'Good signature' in gpg --verify output, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn rsa_sign_verify_with_gpg() {
+    let env = require_env!();
+    sign_verify_roundtrip(&env, &env.rsa_label, "Test RSA <rsa@example.com>");
+}
+
+#[test]
+fn ec_sign_verify_with_gpg() {
+    let env = require_env!();
+    sign_verify_roundtrip(&env, &env.ec_label, "Test EC <ec@example.com>");
+}
+
+// ---------------------------------------------------------------------------
+// Output format
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sign_binary_produces_non_armored_output() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let payload = tmp.path().join("p.bin");
+    let signature = tmp.path().join("p.bin.sig");
+    std::fs::write(&payload, b"binary payload").unwrap();
+
+    sq_pkcs11(&env)
+        .args(["sign", "--binary"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&signature)
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&signature).unwrap();
+    assert!(
+        !bytes.starts_with(b"-----BEGIN"),
+        "binary signature must not start with armor header"
+    );
+    // First byte of an OpenPGP packet header has the high bit set.
+    assert!(
+        !bytes.is_empty() && bytes[0] & 0x80 != 0,
+        "expected OpenPGP packet header, got {:#04x}",
+        bytes.first().copied().unwrap_or(0)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint stability vs --creation-time
+// ---------------------------------------------------------------------------
+
+fn fingerprint_of(cert_path: &Path) -> String {
+    // We don't want a hard dependency on `sq` for this; parse the armored
+    // block manually with `gpg --show-keys` which is universally available
+    // and prints the fingerprint deterministically.
+    let tmp = TempDir::new().unwrap();
+    let home = fresh_gpg_home(&tmp);
+    let out = gpg_in(&home)
+        .args(["--show-keys", "--with-colons"])
+        .arg(cert_path)
+        .output()
+        .expect("gpg --show-keys");
+    assert!(out.status.success(), "gpg --show-keys failed");
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("fpr:") {
+            // colon-separated; the fingerprint is in the 9th column (index 8)
+            // but easier: it's the only all-hex 40-char run.
+            for field in rest.split(':') {
+                if field.len() == 40 && field.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return field.to_string();
+                }
+            }
+        }
+    }
+    panic!("no fingerprint found in:\n{s}");
+}
+
+fn export_cert(env: &TestEnv, key_label: &str, creation_time: &str, dest: &Path) {
+    sq_pkcs11(env)
+        .args(["cert-export"])
+        .args(["--key-label", key_label])
+        .args(["--userid", "Test <stable@example.com>"])
+        .args(["--creation-time", creation_time])
+        .args(["--output"])
+        .arg(dest)
+        .assert()
+        .success();
+}
+
+#[test]
+fn fingerprint_stable_across_runs() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a.asc");
+    let b = tmp.path().join("b.asc");
+
+    export_cert(&env, &env.ec_label, STABLE_TIME, &a);
+    export_cert(&env, &env.ec_label, STABLE_TIME, &b);
+
+    assert_eq!(
+        fingerprint_of(&a),
+        fingerprint_of(&b),
+        "same key + same --creation-time must yield the same fingerprint"
+    );
+}
+
+#[test]
+fn fingerprint_changes_with_creation_time() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a.asc");
+    let b = tmp.path().join("b.asc");
+
+    export_cert(&env, &env.ec_label, "2026-01-01T00:00:00Z", &a);
+    export_cert(&env, &env.ec_label, "2030-01-01T00:00:00Z", &b);
+
+    assert_ne!(
+        fingerprint_of(&a),
+        fingerprint_of(&b),
+        "different --creation-time values must yield different fingerprints"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Validity period
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validity_period_appears_in_cert() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let home = fresh_gpg_home(&tmp);
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--userid", "Validity Test <v@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--validity-period", "1y"])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    let out = gpg_in(&home)
+        .args(["--show-keys", "--with-colons"])
+        .arg(&cert)
+        .output()
+        .expect("gpg --show-keys");
+    assert!(out.status.success());
+
+    // In --with-colons output, a "pub:" line has the expiry timestamp in
+    // column 7 (index 6) — non-zero means an expiry is set.
+    let s = String::from_utf8_lossy(&out.stdout);
+    let pub_line = s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .expect("no pub: line");
+    let expiry = pub_line.split(':').nth(6).expect("no expiry field");
+    assert!(
+        !expiry.is_empty() && expiry != "0",
+        "expected non-zero expiry field on pub: line, got {expiry:?}\nfull line: {pub_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two-tier (primary + signing subkey)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_tier_cert_export_and_subkey_sign() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("two-tier.asc");
+    let payload = tmp.path().join("p.txt");
+    let signature = tmp.path().join("p.txt.asc");
+    let home = fresh_gpg_home(&tmp);
+
+    std::fs::write(&payload, b"two-tier payload\n").unwrap();
+
+    // 1. Build the two-tier cert.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Two-Tier <2t@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--validity-period", "10y"])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--subkey-validity-period", "2y"])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    // 2. Import the cert and check both keys are present with correct flags.
+    gpg_in(&home).arg("--import").arg(&cert).assert_success();
+
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    assert!(listing.status.success());
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+
+    // colon-format: "pub:..." lines for primary, "sub:..." for subkey.
+    // Capability flags in column 12 (index 11).  We expect:
+    //   primary: 'c' (cert) — possibly 'cC' if also a primary signing
+    //   subkey:  's' (sign)
+    let pub_caps = listing_s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .and_then(|l| l.split(':').nth(11))
+        .unwrap_or("");
+    let sub_caps = listing_s
+        .lines()
+        .find(|l| l.starts_with("sub:"))
+        .and_then(|l| l.split(':').nth(11))
+        .unwrap_or("");
+    assert!(
+        pub_caps.contains('c') || pub_caps.contains('C'),
+        "expected primary to have certify capability, caps={pub_caps:?}"
+    );
+    assert!(
+        !pub_caps.contains('s') && !pub_caps.contains('S'),
+        "primary must not be signing-capable in two-tier cert, caps={pub_caps:?}"
+    );
+    assert!(
+        sub_caps.contains('s') || sub_caps.contains('S'),
+        "expected subkey to have signing capability, caps={sub_caps:?}"
+    );
+
+    // 3. Sign with the subkey and verify.
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let verify = gpg_in(&home)
+        .arg("--verify")
+        .arg(&signature)
+        .arg(&payload)
+        .output()
+        .expect("gpg --verify");
+    assert!(
+        verify.status.success(),
+        "gpg --verify failed:\nstderr: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(stderr.contains("Good signature"));
+}
+
+// ---------------------------------------------------------------------------
+// Tiny extension trait so we can write `.assert_success()` on std::Command.
+// ---------------------------------------------------------------------------
+
+trait AssertSuccess {
+    fn assert_success(&mut self);
+}
+impl AssertSuccess for StdCommand {
+    fn assert_success(&mut self) {
+        let out = self.output().expect("command failed to spawn");
+        assert!(
+            out.status.success(),
+            "command exited {:?}\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}

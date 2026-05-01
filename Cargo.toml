@@ -30,3 +30,9 @@ humantime = "2"
 
 # Direct symbol loading for nShield extension functions (C_LoginBegin/Next/End)
 libloading = "0.8"
+
+[dev-dependencies]
+# CLI integration test scaffolding
+assert_cmd = "2"
+tempfile   = "3"
+dotenvy    = "0.15"
