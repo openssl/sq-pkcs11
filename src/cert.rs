@@ -20,10 +20,15 @@ use crate::signer::Pkcs11Signer;
 ///
 /// `creation_time` should reflect the key's actual creation time when known;
 /// pass `None` to use the current system time.
+///
+/// `validity_period` controls when the key stops being able to make new
+/// signatures.  `Some(d)` sets the key to expire `d` after `creation_time`;
+/// `None` means the key never expires.
 pub fn build_cert(
     signer: &mut Pkcs11Signer,
     user_ids: &[String],
     creation_time: Option<std::time::SystemTime>,
+    validity_period: Option<std::time::Duration>,
 ) -> Result<Cert> {
     assert!(!user_ids.is_empty(), "at least one User ID is required");
 
@@ -58,7 +63,7 @@ pub fn build_cert(
         .set_key_flags(flags)?
         .set_preferred_hash_algorithms(preferred_hashes())?
         .set_preferred_symmetric_algorithms(preferred_symmetric())?
-        .set_key_validity_period(None)?
+        .set_key_validity_period(validity_period)?
         .sign_direct_key(signer, cert.primary_key().key())?;
 
     let (cert, _) = cert.insert_packets([Packet::from(direct_sig)])?;

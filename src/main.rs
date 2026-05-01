@@ -190,6 +190,23 @@ struct CertExportArgs {
     /// value that requires no coordination between cert-export and sign.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
+
+    /// Key validity period, relative to the creation time.
+    ///
+    /// Format: integer + unit (y = years, w = weeks, d = days, h = hours).
+    /// Examples: "5y", "730d", "260w".  Defaults to 5 years.
+    /// Years use the calendar approximation 1y = 365.25 days.
+    ///
+    /// Re-issue the certificate before expiry to extend it.
+    #[arg(long, value_name = "DURATION", default_value = "5y", group = "validity")]
+    validity_period: String,
+
+    /// Issue a certificate with no expiration.
+    ///
+    /// Mutually exclusive with --validity-period.  Use sparingly: an
+    /// expiration bounds the blast radius if the HSM is ever compromised.
+    #[arg(long, group = "validity")]
+    no_expiration: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +241,30 @@ fn main() -> anyhow::Result<()> {
         Command::CertExport(args) => cmd_cert_export(&pkcs11, &module, args),
         Command::ListKeys(args) => cmd_list_keys(&pkcs11, args),
     }
+}
+
+/// Parse a validity-period string into a `Duration`.
+///
+/// Accepts:
+/// - `Ny` for years (1y = 365.25 days, calendar-approximate)
+/// - Anything else is delegated to `humantime` (`Nd`, `Nw`, `Nh`, `5d 12h`, ...)
+fn parse_validity(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    if let Some(num_str) = s.strip_suffix('y') {
+        let n: f64 = num_str
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid years value in --validity-period {s:?}"))?;
+        if !n.is_finite() || n < 0.0 {
+            anyhow::bail!("--validity-period must be non-negative");
+        }
+        return Ok(std::time::Duration::from_secs(
+            (n * 365.25 * 86400.0) as u64,
+        ));
+    }
+    humantime::parse_duration(s).with_context(|| {
+        format!("invalid --validity-period {s:?}; use Ny, Nw, Nd, or Nh (e.g. 5y, 60d)")
+    })
 }
 
 /// Parse an optional RFC 3339 timestamp, defaulting to Unix epoch.
@@ -319,12 +360,17 @@ fn cmd_cert_export(
     let login = args.auth.login_mode(module);
 
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let validity = if args.no_expiration {
+        None
+    } else {
+        Some(parse_validity(&args.validity_period)?)
+    };
 
     let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
     let priv_handle = session::resolve_single_key(&session, &selector)?;
     let mut signer = Pkcs11Signer::new(session, priv_handle)?;
 
-    let cert = cert::build_cert(&mut signer, &args.user_ids, Some(creation_time))?;
+    let cert = cert::build_cert(&mut signer, &args.user_ids, Some(creation_time), validity)?;
     let armored = cert::export_armored_cert(&cert)?;
 
     match args.output {
@@ -494,5 +540,40 @@ mod tests {
         // accidentally embed a localtime-interpreted timestamp in a published
         // certificate.
         assert!(parse_creation_time(Some("2026-04-30T16:29:30")).is_err());
+    }
+
+    #[test]
+    fn validity_years_uses_calendar_approximation() {
+        // 1y = 365.25 * 86400 = 31,557,600 s
+        let d = parse_validity("1y").unwrap();
+        assert_eq!(d.as_secs(), 31_557_600);
+        // 5y = 5 * 31,557,600
+        assert_eq!(parse_validity("5y").unwrap().as_secs(), 157_788_000);
+    }
+
+    #[test]
+    fn validity_humantime_units() {
+        // Days, weeks, hours go through humantime.
+        assert_eq!(parse_validity("30d").unwrap().as_secs(), 30 * 86_400);
+        assert_eq!(parse_validity("1w").unwrap().as_secs(), 7 * 86_400);
+        assert_eq!(parse_validity("48h").unwrap().as_secs(), 48 * 3_600);
+    }
+
+    #[test]
+    fn validity_default_is_5_years() {
+        // The clap default value used in the CLI must parse cleanly.
+        assert_eq!(parse_validity("5y").unwrap().as_secs(), 157_788_000);
+    }
+
+    #[test]
+    fn validity_rejects_garbage() {
+        assert!(parse_validity("forever").is_err());
+        assert!(parse_validity("").is_err());
+        assert!(parse_validity("xy").is_err());
+    }
+
+    #[test]
+    fn validity_rejects_negative() {
+        assert!(parse_validity("-3y").is_err());
     }
 }

@@ -99,11 +99,23 @@ available in load-sharing or HSM Pool mode (use `preload` for those).
   --key-label my-signing-key \
   --uid "OpenSSL Release Key <openssl-security@openssl.org>" \
   --creation-time 2026-05-01T00:00:00Z \
+  --validity-period 5y \
   --output release.asc
 ```
 
 Produces an OpenPGP public key block ready for distribution to keyservers
 and your project website. The `--uid` may be repeated.
+
+`--validity-period` defaults to **5 years**. Format: integer + unit
+(`y` years, `w` weeks, `d` days, `h` hours). Years use the calendar
+approximation `1y = 365.25d`. To issue a non-expiring certificate, pass
+`--no-expiration` instead — but prefer a finite period as defence in
+depth: an expired key cannot make new signatures, but old signatures
+made while the key was valid keep verifying indefinitely.
+
+To extend a key beyond its expiry, re-run `cert-export` with the same
+`--creation-time` and a longer `--validity-period`, then redistribute
+the cert.
 
 ### Signing a file
 
