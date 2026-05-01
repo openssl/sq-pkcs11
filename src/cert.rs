@@ -1,13 +1,13 @@
 use sequoia_openpgp::{
-    Cert, Packet,
     crypto::mpi,
     packet::{
-        Key, UserID,
         key::{Key4, PrimaryRole, PublicParts, SubordinateRole, UnspecifiedRole},
         signature::SignatureBuilder,
+        Key, UserID,
     },
     serialize::Serialize,
     types::{Curve, HashAlgorithm, KeyFlags, SignatureType, SymmetricAlgorithm},
+    Cert, Packet,
 };
 
 use crate::error::Result;
@@ -62,17 +62,15 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
     let primary_hash = preferred_hash_for(primary.signer.public_key());
 
     // Build the primary public-key packet pinned to the requested creation time.
-    let primary_key = sequoia_openpgp::packet::Key::V4(
-        Key4::<PublicParts, PrimaryRole>::new(
-            primary.creation_time,
-            primary.signer.public_key().pk_algo(),
-            primary.signer.public_key().mpis().clone(),
-        )?,
-    );
+    let primary_key = sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, PrimaryRole>::new(
+        primary.creation_time,
+        primary.signer.public_key().pk_algo(),
+        primary.signer.public_key().mpis().clone(),
+    )?);
 
     // Seed Cert with the primary; canonicalisation tolerates the missing
     // self-signature until we add it on the next step.
-    let cert = Cert::try_from(vec![Packet::PublicKey(primary_key.into())])?;
+    let cert = Cert::try_from(vec![Packet::PublicKey(primary_key)])?;
 
     // -------- Direct-key self-signature on the primary --------
     let primary_flags = if subkey.is_some() {
@@ -95,19 +93,16 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
     let mut first_uid = true;
     for raw_uid in user_ids {
         let uid = UserID::from(raw_uid.as_str());
-        let mut builder = SignatureBuilder::new(SignatureType::PositiveCertification)
-            .set_hash_algo(primary_hash);
+        let mut builder =
+            SignatureBuilder::new(SignatureType::PositiveCertification).set_hash_algo(primary_hash);
         // Mark exactly the first UID as primary; Sequoia will warn if more
         // than one UID claims primary status.
         if first_uid {
             builder = builder.set_primary_userid(true)?;
             first_uid = false;
         }
-        let uid_sig = builder.sign_userid_binding(
-            primary.signer,
-            cert.primary_key().key(),
-            &uid,
-        )?;
+        let uid_sig =
+            builder.sign_userid_binding(primary.signer, cert.primary_key().key(), &uid)?;
         uid_packets.push(uid.into());
         uid_packets.push(uid_sig.into());
     }
@@ -117,13 +112,12 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
     let cert = if let Some(sk) = subkey {
         let subkey_hash = preferred_hash_for(sk.signer.public_key());
 
-        let subkey_key = sequoia_openpgp::packet::Key::V4(
-            Key4::<PublicParts, SubordinateRole>::new(
+        let subkey_key =
+            sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, SubordinateRole>::new(
                 sk.creation_time,
                 sk.signer.public_key().pk_algo(),
                 sk.signer.public_key().mpis().clone(),
-            )?,
-        );
+            )?);
 
         // Cross-sig — subkey signer attests it consents to being bound.
         // Required for any signing-capable subkey to prevent subkey hijacking.
@@ -139,10 +133,8 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
             .set_embedded_signature(cross_sig)?
             .sign_subkey_binding(primary.signer, cert.primary_key().key(), &subkey_key)?;
 
-        let (cert, _) = cert.insert_packets([
-            Packet::PublicSubkey(subkey_key.into()),
-            Packet::from(binding_sig),
-        ])?;
+        let (cert, _) =
+            cert.insert_packets([Packet::PublicSubkey(subkey_key), Packet::from(binding_sig)])?;
         cert
     } else {
         cert

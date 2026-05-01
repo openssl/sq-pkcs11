@@ -36,8 +36,8 @@ pub const CKR_FIPS_FUNCTION_NOT_SUPPORTED: CK_RV = 0x8000_0003;
 type FnLoginBegin = unsafe extern "C" fn(
     session: CK_SESSION_HANDLE,
     user_type: CK_USER_TYPE,
-    pk_out: *mut CK_ULONG,  // K (shares required)
-    pn_out: *mut CK_ULONG,  // N (total shares in set)
+    pk_out: *mut CK_ULONG, // K (shares required)
+    pn_out: *mut CK_ULONG, // N (total shares in set)
 ) -> CK_RV;
 
 type FnLoginNext = unsafe extern "C" fn(
@@ -48,10 +48,8 @@ type FnLoginNext = unsafe extern "C" fn(
     shares_left: *mut CK_ULONG,
 ) -> CK_RV;
 
-type FnLoginEnd = unsafe extern "C" fn(
-    session: CK_SESSION_HANDLE,
-    user_type: CK_USER_TYPE,
-) -> CK_RV;
+type FnLoginEnd =
+    unsafe extern "C" fn(session: CK_SESSION_HANDLE, user_type: CK_USER_TYPE) -> CK_RV;
 
 /// Loaded handles to the three nShield quorum login functions.
 pub struct NshieldQuorumLogin {
@@ -97,13 +95,13 @@ impl NshieldQuorumLogin {
     /// `prompt` is called once per required card with the card index (1-based)
     /// and the remaining shares count, and must return the card passphrase
     /// (empty slice if the card has no passphrase).
-    pub fn quorum_login<F>(
-        &self,
-        session: CK_SESSION_HANDLE,
-        mut prompt: F,
-    ) -> Result<()>
+    pub fn quorum_login<F>(&self, session: CK_SESSION_HANDLE, mut prompt: F) -> Result<()>
     where
-        F: FnMut(/*card_n:*/ u64, /*k_required:*/ u64, /*n_total:*/ u64) -> Result<String>,
+        F: FnMut(
+            /*card_n:*/ u64,
+            /*k_required:*/ u64,
+            /*n_total:*/ u64,
+        ) -> Result<String>,
     {
         let mut k: CK_ULONG = 0;
         let mut n: CK_ULONG = 0;
@@ -111,9 +109,7 @@ impl NshieldQuorumLogin {
         let rv = unsafe { (self.login_begin)(session, CKU_USER, &mut k, &mut n) };
         ck_ok(rv, "C_LoginBegin")?;
 
-        eprintln!(
-            "OCS quorum login: need {k} of {n} cards.",
-        );
+        eprintln!("OCS quorum login: need {k} of {n} cards.",);
 
         let mut shares_left: CK_ULONG = k;
         let mut card_index: u64 = 1;

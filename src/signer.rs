@@ -118,16 +118,16 @@ impl Signer for Pkcs11Signer {
 fn digest_info_prefix(hash_algo: HashAlgorithm) -> sequoia_openpgp::Result<&'static [u8]> {
     Ok(match hash_algo {
         HashAlgorithm::SHA256 => &[
-            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
-            0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01, 0x05, 0x00, 0x04, 0x20,
         ],
         HashAlgorithm::SHA384 => &[
-            0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
-            0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+            0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x02, 0x05, 0x00, 0x04, 0x30,
         ],
         HashAlgorithm::SHA512 => &[
-            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
-            0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x03, 0x05, 0x00, 0x04, 0x40,
         ],
         other => {
             return Err(sequoia_openpgp::Error::InvalidArgument(format!(
@@ -157,10 +157,7 @@ pub fn read_public_key(
 /// PKCS#11 mandates that key pairs share a CKA_ID value.  Public key attributes
 /// such as CKA_EC_POINT are only guaranteed to be present on the public key
 /// object, not the private key object.
-fn find_companion_public_key(
-    session: &Session,
-    priv_handle: ObjectHandle,
-) -> Result<ObjectHandle> {
+fn find_companion_public_key(session: &Session, priv_handle: ObjectHandle) -> Result<ObjectHandle> {
     let id_attr = session
         .get_attributes(priv_handle, &[AttributeType::Id])?
         .into_iter()
@@ -175,14 +172,9 @@ fn find_companion_public_key(
         Attribute::Id(id_attr),
     ])?;
 
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            Error::UnsupportedKeyType(
-                "no CKO_PUBLIC_KEY object found with matching CKA_ID".into(),
-            )
-        })
+    candidates.into_iter().next().ok_or_else(|| {
+        Error::UnsupportedKeyType("no CKO_PUBLIC_KEY object found with matching CKA_ID".into())
+    })
 }
 
 fn read_rsa_public(
@@ -217,7 +209,9 @@ fn read_rsa_public(
         mpi::PublicKey::RSA { e, n },
     )?;
 
-    Ok(sequoia_openpgp::packet::Key::V4(key.role_into_unspecified()))
+    Ok(sequoia_openpgp::packet::Key::V4(
+        key.role_into_unspecified(),
+    ))
 }
 
 fn read_ec_public(
@@ -228,8 +222,10 @@ fn read_ec_public(
     // Find the companion public key by matching CKA_ID.
     let pub_handle = find_companion_public_key(session, priv_handle)?;
 
-    let attrs = session
-        .get_attributes(pub_handle, &[AttributeType::EcParams, AttributeType::EcPoint])?;
+    let attrs = session.get_attributes(
+        pub_handle,
+        &[AttributeType::EcParams, AttributeType::EcPoint],
+    )?;
 
     let mut ec_params = None;
     let mut ec_point = None;
@@ -241,8 +237,8 @@ fn read_ec_public(
         }
     }
 
-    let params =
-        ec_params.ok_or_else(|| Error::UnsupportedKeyType("EC key missing CKA_EC_PARAMS".into()))?;
+    let params = ec_params
+        .ok_or_else(|| Error::UnsupportedKeyType("EC key missing CKA_EC_PARAMS".into()))?;
     let curve = oid_to_curve(&params)?;
 
     let point_der =
@@ -257,7 +253,9 @@ fn read_ec_public(
         mpi::PublicKey::ECDSA { curve, q },
     )?;
 
-    Ok(sequoia_openpgp::packet::Key::V4(key.role_into_unspecified()))
+    Ok(sequoia_openpgp::packet::Key::V4(
+        key.role_into_unspecified(),
+    ))
 }
 
 /// Map a DER-encoded OID from CKA_EC_PARAMS to a Sequoia `Curve`.
@@ -508,8 +506,8 @@ mod tests {
         assert_eq!(
             prefix,
             &[
-                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
-                0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, 0x05, 0x00, 0x04, 0x20,
             ]
         );
         // Trailing length byte must equal SHA-256 output size in bytes.
@@ -522,8 +520,8 @@ mod tests {
         assert_eq!(
             prefix,
             &[
-                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
-                0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x02, 0x05, 0x00, 0x04, 0x30,
             ]
         );
         assert_eq!(*prefix.last().unwrap(), 48);
@@ -535,8 +533,8 @@ mod tests {
         assert_eq!(
             prefix,
             &[
-                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
-                0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x03, 0x05, 0x00, 0x04, 0x40,
             ]
         );
         assert_eq!(*prefix.last().unwrap(), 64);

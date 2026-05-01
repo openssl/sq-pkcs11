@@ -109,9 +109,7 @@ pub enum LoginMode<'a> {
     /// Softcard or single-card OCS (K=1): standard C_Login with a passphrase.
     Pin(&'a str),
     /// OCS with K > 1: nShield C_LoginBegin / C_LoginNext / C_LoginEnd.
-    OcsQuorum {
-        module_path: &'a Path,
-    },
+    OcsQuorum { module_path: &'a Path },
 }
 
 /// Open a PKCS#11 session on the slot best matching `selector` and log in
@@ -126,14 +124,16 @@ pub enum LoginMode<'a> {
 ///  - Login required: require a single visible slot; error if there are
 ///    several, since the caller must specify which token to authenticate
 ///    against — use `--key-uri pkcs11:token=<label>...` to disambiguate.
-pub fn open_session<'a>(
+pub fn open_session(
     pkcs11: &Pkcs11,
     selector: &KeySelector,
     login_mode: &LoginMode<'_>,
 ) -> Result<(Session, Slot)> {
     let slots = pkcs11.get_slots_with_initialized_token()?;
     if slots.is_empty() {
-        return Err(Error::KeyNotFound("no initialised PKCS#11 slots found".into()));
+        return Err(Error::KeyNotFound(
+            "no initialised PKCS#11 slots found".into(),
+        ));
     }
 
     let slot = match selector {

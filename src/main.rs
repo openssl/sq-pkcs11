@@ -11,9 +11,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use sequoia_openpgp::{
-    packet::signature::SignatureBuilder,
-    serialize::stream::*,
-    types::SignatureType,
+    packet::signature::SignatureBuilder, serialize::stream::*, types::SignatureType,
 };
 
 use session::{KeySelector, LoginMode, Pkcs11Uri};
@@ -28,12 +26,7 @@ struct Cli {
     /// May also be set via the PKCS11_MODULE_PATH environment variable
     /// (standard, used by pkcs11-tool / p11-kit) or SQ_PKCS11_MODULE
     /// (tool-specific fallback, checked when PKCS11_MODULE_PATH is unset).
-    #[arg(
-        short = 'm',
-        long,
-        env = "PKCS11_MODULE_PATH",
-        value_name = "PATH"
-    )]
+    #[arg(short = 'm', long, env = "PKCS11_MODULE_PATH", value_name = "PATH")]
     module: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -116,7 +109,9 @@ struct AuthArgs {
 impl AuthArgs {
     fn login_mode<'a>(&'a self, module: &'a std::path::Path) -> LoginMode<'a> {
         if self.ocs {
-            return LoginMode::OcsQuorum { module_path: module };
+            return LoginMode::OcsQuorum {
+                module_path: module,
+            };
         }
         match self.pin.as_deref() {
             Some(pin) => LoginMode::Pin(pin),
@@ -199,7 +194,12 @@ struct CertExportArgs {
     /// Years use the calendar approximation 1y = 365.25 days.
     ///
     /// Re-issue the certificate before expiry to extend it.
-    #[arg(long, value_name = "DURATION", default_value = "5y", group = "validity")]
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "5y",
+        group = "validity"
+    )]
     validity_period: String,
 
     /// Issue a certificate with no expiration.
@@ -234,7 +234,12 @@ struct CertExportArgs {
     subkey_auto: bool,
 
     /// PIN / passphrase for the subkey, if it is softcard- or single-card-OCS-protected.
-    #[arg(long, env = "SQ_PKCS11_SUBKEY_PIN", group = "subkey_auth", requires = "subkey_selector")]
+    #[arg(
+        long,
+        env = "SQ_PKCS11_SUBKEY_PIN",
+        group = "subkey_auth",
+        requires = "subkey_selector"
+    )]
     subkey_pin: Option<String>,
 
     /// Use nShield K/N quorum login for the subkey.
@@ -305,8 +310,8 @@ fn resolve_subkey_selector(args: &CertExportArgs) -> anyhow::Result<Option<KeySe
         return Ok(Some(KeySelector::Label(label.clone())));
     }
     if let Some(id_hex) = &args.subkey_id {
-        let bytes = hex::decode(id_hex)
-            .with_context(|| format!("invalid hex in --subkey-id: {id_hex}"))?;
+        let bytes =
+            hex::decode(id_hex).with_context(|| format!("invalid hex in --subkey-id: {id_hex}"))?;
         return Ok(Some(KeySelector::Id(bytes)));
     }
     if args.subkey_auto {
@@ -316,12 +321,11 @@ fn resolve_subkey_selector(args: &CertExportArgs) -> anyhow::Result<Option<KeySe
 }
 
 /// Build a `LoginMode` for the subkey from --subkey-pin / --subkey-ocs.
-fn build_subkey_login<'a>(
-    args: &'a CertExportArgs,
-    module: &'a std::path::Path,
-) -> LoginMode<'a> {
+fn build_subkey_login<'a>(args: &'a CertExportArgs, module: &'a std::path::Path) -> LoginMode<'a> {
     if args.subkey_ocs {
-        return LoginMode::OcsQuorum { module_path: module };
+        return LoginMode::OcsQuorum {
+            module_path: module,
+        };
     }
     match args.subkey_pin.as_deref() {
         Some(pin) => LoginMode::Pin(pin),
@@ -360,8 +364,9 @@ fn parse_validity(s: &str) -> anyhow::Result<std::time::Duration> {
 fn parse_creation_time(s: Option<&str>) -> anyhow::Result<std::time::SystemTime> {
     match s {
         None => Ok(std::time::SystemTime::UNIX_EPOCH),
-        Some(ts) => humantime::parse_rfc3339(ts)
-            .with_context(|| format!("invalid --creation-time {ts:?}; use RFC 3339, e.g. 2026-04-30T16:29:30Z")),
+        Some(ts) => humantime::parse_rfc3339(ts).with_context(|| {
+            format!("invalid --creation-time {ts:?}; use RFC 3339, e.g. 2026-04-30T16:29:30Z")
+        }),
     }
 }
 
@@ -395,8 +400,8 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
     let mut signer = Pkcs11Signer::new(session, priv_handle)?;
     signer.set_creation_time(creation_time)?;
 
-    let data = std::fs::read(&args.file)
-        .with_context(|| format!("reading {}", args.file.display()))?;
+    let data =
+        std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
 
     let sig_path = args.output.unwrap_or_else(|| {
         let mut p = args.file.clone();
@@ -416,13 +421,10 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
         } else {
             Armorer::new(sink).build()?
         };
-        let mut signing_stream = Signer::with_template(
-            sink,
-            signer,
-            SignatureBuilder::new(SignatureType::Binary),
-        )?
-        .detached()
-        .build()?;
+        let mut signing_stream =
+            Signer::with_template(sink, signer, SignatureBuilder::new(SignatureType::Binary))?
+                .detached()
+                .build()?;
         signing_stream.write_all(&data)?;
         signing_stream.finalize()?;
     }
@@ -452,8 +454,7 @@ fn cmd_cert_export(
         Some(parse_validity(&args.validity_period)?)
     };
 
-    let (primary_session, _) =
-        session::open_session(pkcs11, &primary_selector, &primary_login)?;
+    let (primary_session, _) = session::open_session(pkcs11, &primary_selector, &primary_login)?;
     let primary_handle = session::resolve_single_key(&primary_session, &primary_selector)?;
     let mut primary_signer = Pkcs11Signer::new(primary_session, primary_handle)?;
 
@@ -486,13 +487,11 @@ fn cmd_cert_export(
         creation_time: primary_creation_time,
         validity_period: primary_validity,
     };
-    let subkey_spec = subkey_signer_holder
-        .as_mut()
-        .map(|signer| cert::KeySpec {
-            signer,
-            creation_time: subkey_creation_time,
-            validity_period: subkey_validity,
-        });
+    let subkey_spec = subkey_signer_holder.as_mut().map(|signer| cert::KeySpec {
+        signer,
+        creation_time: subkey_creation_time,
+        validity_period: subkey_validity,
+    });
 
     let spec = cert::CertSpec {
         primary: primary_spec,
