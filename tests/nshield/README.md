@@ -32,6 +32,7 @@ generatekey pkcs11 protect=module type=RSA   size=4096 plainname=sq-pkcs11-nshie
 generatekey pkcs11 protect=module type=ECDSA size=384  plainname=sq-pkcs11-nshield-test-p384
 generatekey pkcs11 protect=module type=ECDSA size=384  plainname=sq-pkcs11-nshield-test-primary
 generatekey pkcs11 protect=module type=ECDSA size=384  plainname=sq-pkcs11-nshield-test-subkey
+generatekey pkcs11 protect=module type=ECDSA size=384  plainname=sq-pkcs11-nshield-test-subkey2
 ```
 
 All four keys must be **module-protected**. The integration suite cannot

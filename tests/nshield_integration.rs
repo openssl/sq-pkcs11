@@ -27,6 +27,7 @@ struct TestEnv {
     ec_label: String,
     primary_label: String,
     subkey_label: String,
+    subkey2_label: String,
 }
 
 /// Load `tests/nshield/test.env` into the process environment exactly once,
@@ -48,6 +49,7 @@ fn test_env() -> Option<TestEnv> {
         ec_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_EC").ok()?,
         primary_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_PRIMARY").ok()?,
         subkey_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_SUBKEY").ok()?,
+        subkey2_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_SUBKEY2").ok()?,
     })
 }
 
@@ -127,6 +129,7 @@ fn list_keys_shows_test_keys() {
         &env.ec_label,
         &env.primary_label,
         &env.subkey_label,
+        &env.subkey2_label,
     ] {
         assert!(
             stdout.contains(label.as_str()),
@@ -508,6 +511,240 @@ fn two_tier_cert_export_and_subkey_sign() {
     );
     let stderr = String::from_utf8_lossy(&verify.stderr);
     assert!(stderr.contains("Good signature"));
+}
+
+// ---------------------------------------------------------------------------
+// Revocation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cert_revoke_marks_primary_revoked() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let revocation = tmp.path().join("revocation.asc");
+    let home = fresh_gpg_home(&tmp);
+
+    // 1. Export a fresh cert.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--userid", "Revoke Test <revoke@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    // 2. Issue a revocation against the same key + creation time.
+    sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "superseded"])
+        .args(["--message", "test rotation"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .success();
+
+    // 3. Import cert first, then the revocation.
+    gpg_in(&home).arg("--import").arg(&cert).assert_success();
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&revocation)
+        .assert_success();
+
+    // 4. List the key — colon-format includes 'r' in column 2 of pub: when revoked.
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    assert!(listing.status.success());
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+    let pub_line = listing_s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .expect("no pub: line");
+    let validity = pub_line.split(':').nth(1).unwrap_or("");
+    assert!(
+        validity.contains('r'),
+        "expected primary to be revoked (validity contains 'r'), got pub: line: {pub_line}"
+    );
+}
+
+#[test]
+fn subkey_revoke_marks_only_subkey_revoked() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let revocation = tmp.path().join("subkey-revocation.asc");
+    let home = fresh_gpg_home(&tmp);
+
+    // Build a two-tier cert.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Subkey Revoke Test <skrev@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    // Revoke only the subkey.
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--message", "subkey lost"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .success();
+
+    gpg_in(&home).arg("--import").arg(&cert).assert_success();
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&revocation)
+        .assert_success();
+
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    assert!(listing.status.success());
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+
+    // Primary validity column 2 must NOT contain 'r'; subkey's MUST.
+    let pub_line = listing_s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .expect("no pub: line");
+    let pub_validity = pub_line.split(':').nth(1).unwrap_or("");
+    assert!(
+        !pub_validity.contains('r'),
+        "primary must not be revoked when only the subkey is, got pub: line: {pub_line}"
+    );
+
+    let sub_line = listing_s
+        .lines()
+        .find(|l| l.starts_with("sub:"))
+        .expect("no sub: line");
+    let sub_validity = sub_line.split(':').nth(1).unwrap_or("");
+    assert!(
+        sub_validity.contains('r'),
+        "expected subkey to be revoked, got sub: line: {sub_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subkey rotation via cert-export --merge-cert
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_cert_preserves_old_subkey() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_v1 = tmp.path().join("cert-v1.asc");
+    let cert_v2 = tmp.path().join("cert-v2.asc");
+    let payload_old = tmp.path().join("old.txt");
+    let payload_new = tmp.path().join("new.txt");
+    let home = fresh_gpg_home(&tmp);
+
+    std::fs::write(&payload_old, b"signed by old subkey\n").unwrap();
+    std::fs::write(&payload_new, b"signed by new subkey\n").unwrap();
+
+    // 1. Initial cert with primary + subkey1.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Rotation Test <rot@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_v1)
+        .assert()
+        .success();
+
+    // 2. Sign payload_old with subkey1 BEFORE rotation.
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload_old)
+        .assert()
+        .success();
+
+    // 3. Merge — same primary creation time, new subkey, distinct subkey
+    //    creation time so the new subkey has its own fingerprint.
+    let new_subkey_time = "2026-06-01T00:00:00Z";
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--merge-cert"])
+        .arg(&cert_v1)
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey2_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", new_subkey_time])
+        .args(["--output"])
+        .arg(&cert_v2)
+        .assert()
+        .success();
+
+    // 4. Sign payload_new with subkey2 AFTER rotation.
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey2_label])
+        .args(["--creation-time", new_subkey_time])
+        .arg(&payload_new)
+        .assert()
+        .success();
+
+    // 5. Import the merged cert and confirm both subkeys are present.
+    gpg_in(&home).arg("--import").arg(&cert_v2).assert_success();
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    assert!(listing.status.success());
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+    let sub_count = listing_s.lines().filter(|l| l.starts_with("sub:")).count();
+    assert_eq!(
+        sub_count, 2,
+        "merged cert must contain both old and new subkeys, found {sub_count} sub: lines"
+    );
+
+    // 6. Both signatures verify against the merged cert.
+    let sig_old = payload_old.with_extension("txt.asc");
+    let sig_new = payload_new.with_extension("txt.asc");
+    for (sig, payload, label) in [
+        (&sig_old, &payload_old, "old subkey"),
+        (&sig_new, &payload_new, "new subkey"),
+    ] {
+        let verify = gpg_in(&home)
+            .arg("--verify")
+            .arg(sig)
+            .arg(payload)
+            .output()
+            .expect("gpg --verify");
+        assert!(
+            verify.status.success(),
+            "verification with merged cert failed for {label}:\nstderr: {}",
+            String::from_utf8_lossy(&verify.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&verify.stderr);
+        assert!(
+            stderr.contains("Good signature"),
+            "expected Good signature for {label}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

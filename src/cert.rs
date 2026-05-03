@@ -1,16 +1,21 @@
 use sequoia_openpgp::{
+    armor,
+    cert::{CertRevocationBuilder, SubkeyRevocationBuilder},
     crypto::mpi,
     packet::{
         key::{Key4, PrimaryRole, PublicParts, SubordinateRole, UnspecifiedRole},
         signature::SignatureBuilder,
-        Key, UserID,
+        Key, Signature, UserID,
     },
-    serialize::Serialize,
-    types::{Curve, HashAlgorithm, KeyFlags, SignatureType, SymmetricAlgorithm},
+    parse::Parse,
+    serialize::Marshal,
+    types::{
+        Curve, HashAlgorithm, KeyFlags, ReasonForRevocation, SignatureType, SymmetricAlgorithm,
+    },
     Cert, Packet,
 };
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::signer::Pkcs11Signer;
 
 /// Per-key inputs to the certificate builder.
@@ -25,32 +30,49 @@ pub struct KeySpec<'a> {
 /// When `subkey` is `None`, the resulting cert has a single primary key with
 /// both `Certify` and `Sign` capabilities.  When `subkey` is `Some`, the
 /// primary becomes `Certify`-only and the subkey carries the `Sign` flag.
+///
+/// When `merge_into` is `Some`, the new packets (UID bindings + subkey)
+/// are inserted into the existing cert rather than seeding a fresh one.
+/// In merge mode we never re-issue the primary's direct-key signature and
+/// new UIDs are not marked as primary.
 pub struct CertSpec<'a> {
     pub primary: KeySpec<'a>,
     pub subkey: Option<KeySpec<'a>>,
     pub user_ids: &'a [String],
+    pub merge_into: Option<&'a Cert>,
 }
 
-/// Build an OpenPGP certificate around HSM-backed signer(s).
+/// Build (or extend) an OpenPGP certificate around HSM-backed signer(s).
 ///
-/// Single-key cert (no subkey):
-/// 1. Direct-key self-sig over primary (flags = Certify + Sign)
+/// Fresh cert (merge_into = None):
+/// 1. Direct-key self-sig over primary
+///    (flags = Certify+Sign without subkey, Certify-only with subkey)
 /// 2. Positive-certification self-sig per User ID
+/// 3. Subkey + cross-sig + binding-sig if a subkey is supplied
 ///
-/// Two-tier cert (subkey present):
-/// 1. Direct-key self-sig over primary (flags = Certify only)
-/// 2. Positive-certification self-sig per User ID
-/// 3. Cross-sig: subkey signs (primary, subkey) as PrimaryKeyBinding
-/// 4. Subkey-binding: primary signs (primary, subkey) as SubkeyBinding,
-///    with the cross-sig embedded in the hashed area.
+/// Merge cert (merge_into = Some):
+/// 1. Verify the existing cert's primary fingerprint matches what we
+///    would generate from the HSM key + creation time.  Refuse on mismatch.
+/// 2. Skip the direct-key signature — the existing one stays.
+/// 3. Add UID + binding-sig per `user_ids` (may be empty in merge mode).
+/// 4. Add subkey + cross-sig + binding-sig if a subkey is supplied.
+///
+/// All historical packets in `merge_into` (old subkeys, prior UIDs,
+/// existing revocations, etc.) are preserved.
 pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
     let CertSpec {
         primary,
         mut subkey,
         user_ids,
+        merge_into,
     } = spec;
 
-    assert!(!user_ids.is_empty(), "at least one User ID is required");
+    if merge_into.is_none() {
+        assert!(
+            !user_ids.is_empty(),
+            "fresh cert requires at least one User ID"
+        );
+    }
 
     // Stamp creation times on the cached public keys so signature issuer
     // fingerprints match the cert key fingerprints.
@@ -68,36 +90,56 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
         primary.signer.public_key().mpis().clone(),
     )?);
 
-    // Seed Cert with the primary; canonicalisation tolerates the missing
-    // self-signature until we add it on the next step.
-    let cert = Cert::try_from(vec![Packet::PublicKey(primary_key)])?;
+    let cert = match merge_into {
+        Some(existing) => {
+            // Refuse to merge if fingerprints disagree — would silently
+            // produce an inconsistent cert.
+            let existing_fpr = existing.primary_key().key().fingerprint();
+            let new_fpr = primary_key.fingerprint();
+            if existing_fpr != new_fpr {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "primary fingerprint mismatch: existing cert has {existing_fpr}, \
+                     HSM-derived primary is {new_fpr} \
+                     (check --creation-time matches the existing cert)"
+                )));
+            }
+            existing.clone()
+        }
+        None => {
+            // Seed Cert with the primary; canonicalisation tolerates the missing
+            // self-signature until we add it on the next step.
+            let cert = Cert::try_from(vec![Packet::PublicKey(primary_key)])?;
 
-    // -------- Direct-key self-signature on the primary --------
-    let primary_flags = if subkey.is_some() {
-        KeyFlags::empty().set_certification()
-    } else {
-        KeyFlags::empty().set_certification().set_signing()
+            // -------- Direct-key self-signature on the primary --------
+            let primary_flags = if subkey.is_some() {
+                KeyFlags::empty().set_certification()
+            } else {
+                KeyFlags::empty().set_certification().set_signing()
+            };
+            let direct_sig = SignatureBuilder::new(SignatureType::DirectKey)
+                .set_hash_algo(primary_hash)
+                .set_key_flags(primary_flags)?
+                .set_preferred_hash_algorithms(preferred_hashes())?
+                .set_preferred_symmetric_algorithms(preferred_symmetric())?
+                .set_key_validity_period(primary.validity_period)?
+                .sign_direct_key(primary.signer, cert.primary_key().key())?;
+
+            let (cert, _) = cert.insert_packets([Packet::from(direct_sig)])?;
+            cert
+        }
     };
-    let direct_sig = SignatureBuilder::new(SignatureType::DirectKey)
-        .set_hash_algo(primary_hash)
-        .set_key_flags(primary_flags)?
-        .set_preferred_hash_algorithms(preferred_hashes())?
-        .set_preferred_symmetric_algorithms(preferred_symmetric())?
-        .set_key_validity_period(primary.validity_period)?
-        .sign_direct_key(primary.signer, cert.primary_key().key())?;
-
-    let (cert, _) = cert.insert_packets([Packet::from(direct_sig)])?;
 
     // -------- User ID binding signatures --------
+    // In merge mode we do not mark new UIDs as primary, since the existing
+    // cert already designates one and Sequoia warns about ambiguous primary.
+    let mark_primary_uid = merge_into.is_none();
     let mut uid_packets: Vec<Packet> = Vec::with_capacity(user_ids.len() * 2);
     let mut first_uid = true;
     for raw_uid in user_ids {
         let uid = UserID::from(raw_uid.as_str());
         let mut builder =
             SignatureBuilder::new(SignatureType::PositiveCertification).set_hash_algo(primary_hash);
-        // Mark exactly the first UID as primary; Sequoia will warn if more
-        // than one UID claims primary status.
-        if first_uid {
+        if mark_primary_uid && first_uid {
             builder = builder.set_primary_userid(true)?;
             first_uid = false;
         }
@@ -143,6 +185,140 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
     Ok(cert)
 }
 
+// ---------------------------------------------------------------------------
+// Revocation
+// ---------------------------------------------------------------------------
+
+/// Inputs for primary-key revocation.
+pub struct CertRevocationSpec<'a> {
+    pub primary: KeySpec<'a>,
+    pub reason: ReasonForRevocation,
+    pub message: &'a [u8],
+    pub revocation_time: std::time::SystemTime,
+}
+
+/// Inputs for subkey revocation.  Both the primary (which signs) and the
+/// subkey (whose public material we hash over) must be supplied; only the
+/// primary signs the resulting signature.
+pub struct SubkeyRevocationSpec<'a> {
+    pub primary: KeySpec<'a>,
+    pub subkey: KeySpec<'a>,
+    pub reason: ReasonForRevocation,
+    pub message: &'a [u8],
+    pub revocation_time: std::time::SystemTime,
+}
+
+/// Build a standalone primary-key revocation signature.
+pub fn build_cert_revocation(spec: CertRevocationSpec<'_>) -> Result<Signature> {
+    spec.primary
+        .signer
+        .set_creation_time(spec.primary.creation_time)?;
+
+    let primary_key = sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, PrimaryRole>::new(
+        spec.primary.creation_time,
+        spec.primary.signer.public_key().pk_algo(),
+        spec.primary.signer.public_key().mpis().clone(),
+    )?);
+    // Sequoia's revocation builder needs a Cert just for hashing context.
+    // A primary-only Cert canonicalises fine here.
+    let cert = Cert::try_from(vec![Packet::PublicKey(primary_key)])?;
+
+    let primary_hash = preferred_hash_for(spec.primary.signer.public_key());
+
+    let sig = CertRevocationBuilder::new()
+        .set_signature_creation_time(spec.revocation_time)?
+        .set_reason_for_revocation(spec.reason, spec.message)?
+        .build(spec.primary.signer, &cert, primary_hash)?;
+
+    Ok(sig)
+}
+
+/// Build a standalone subkey revocation signature.
+pub fn build_subkey_revocation(spec: SubkeyRevocationSpec<'_>) -> Result<Signature> {
+    spec.primary
+        .signer
+        .set_creation_time(spec.primary.creation_time)?;
+    spec.subkey
+        .signer
+        .set_creation_time(spec.subkey.creation_time)?;
+
+    let primary_key = sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, PrimaryRole>::new(
+        spec.primary.creation_time,
+        spec.primary.signer.public_key().pk_algo(),
+        spec.primary.signer.public_key().mpis().clone(),
+    )?);
+    let subkey_key = sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, SubordinateRole>::new(
+        spec.subkey.creation_time,
+        spec.subkey.signer.public_key().pk_algo(),
+        spec.subkey.signer.public_key().mpis().clone(),
+    )?);
+    let cert = Cert::try_from(vec![Packet::PublicKey(primary_key)])?;
+
+    let primary_hash = preferred_hash_for(spec.primary.signer.public_key());
+
+    let sig = SubkeyRevocationBuilder::new()
+        .set_signature_creation_time(spec.revocation_time)?
+        .set_reason_for_revocation(spec.reason, spec.message)?
+        .build(spec.primary.signer, &cert, &subkey_key, primary_hash)?;
+
+    Ok(sig)
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+/// Serialize a certificate to an armored OpenPGP public key block.
+pub fn export_armored_cert(cert: &Cert) -> Result<String> {
+    let mut buf = Vec::new();
+    cert.armored().serialize(&mut buf)?;
+    Ok(String::from_utf8(buf).expect("armored output is valid UTF-8"))
+}
+
+/// Serialize a certificate as raw OpenPGP packets (no armor).
+pub fn export_binary_cert(cert: &Cert) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    cert.serialize(&mut buf)?;
+    Ok(buf)
+}
+
+/// Wrap a single signature packet (typically a revocation) in OpenPGP armor.
+///
+/// Uses `PUBLIC KEY BLOCK` armor and a `Comment` header matching the GnuPG
+/// `--gen-revoke` convention so importers display a clear hint.
+pub fn export_armored_signature(sig: &Signature) -> Result<String> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = armor::Writer::with_headers(
+            &mut buf,
+            armor::Kind::PublicKey,
+            vec![("Comment", "This is a revocation certificate")],
+        )
+        .map_err(|e| Error::Other(anyhow::anyhow!("armor writer init: {e}")))?;
+        sig.serialize(&mut writer)?;
+        writer
+            .finalize()
+            .map_err(|e| Error::Other(anyhow::anyhow!("armor finalize: {e}")))?;
+    }
+    Ok(String::from_utf8(buf).expect("armored output is valid UTF-8"))
+}
+
+/// Serialize a single signature packet without armor.
+pub fn export_binary_signature(sig: &Signature) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    sig.serialize(&mut buf)?;
+    Ok(buf)
+}
+
+/// Parse a public OpenPGP certificate from a buffer (armored or binary).
+pub fn parse_cert(bytes: &[u8]) -> Result<Cert> {
+    Cert::from_bytes(bytes).map_err(|e| Error::Other(anyhow::anyhow!("parsing cert: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Hash algorithm helpers
+// ---------------------------------------------------------------------------
+
 /// Pick a hash algorithm whose strength matches the signing key.
 ///
 /// For ECDSA the choice follows NIST SP 800-57: pair each curve with a hash
@@ -175,11 +351,4 @@ fn preferred_hashes() -> Vec<HashAlgorithm> {
 
 fn preferred_symmetric() -> Vec<SymmetricAlgorithm> {
     vec![SymmetricAlgorithm::AES256, SymmetricAlgorithm::AES128]
-}
-
-/// Serialize a certificate to an armored OpenPGP public key block.
-pub fn export_armored_cert(cert: &Cert) -> Result<String> {
-    let mut buf = Vec::new();
-    cert.armored().serialize(&mut buf)?;
-    Ok(String::from_utf8(buf).expect("armored output is valid UTF-8"))
 }

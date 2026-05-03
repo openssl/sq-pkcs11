@@ -39,6 +39,10 @@ enum Command {
     Sign(SignArgs),
     /// Export the OpenPGP public certificate from an HSM key.
     CertExport(CertExportArgs),
+    /// Issue a primary-key revocation certificate.
+    CertRevoke(CertRevokeArgs),
+    /// Issue a subkey-revocation certificate.
+    SubkeyRevoke(SubkeyRevokeArgs),
     /// List signing keys visible in the PKCS#11 token.
     ListKeys(ListKeysArgs),
 }
@@ -170,12 +174,37 @@ struct CertExportArgs {
 
     /// User ID to embed, e.g. "OpenSSL Release Key <openssl-security@openssl.org>".
     /// Repeat to add multiple User IDs.  Matches `sq key generate --userid`.
-    #[arg(long = "userid", value_name = "USERID", required = true)]
+    ///
+    /// Required for fresh certs.  Optional with --merge-cert: omitted means
+    /// keep the existing cert's UIDs as-is; supplied UIDs are *added*.
+    #[arg(
+        long = "userid",
+        value_name = "USERID",
+        required_unless_present = "merge_cert"
+    )]
     user_ids: Vec<String>,
 
     /// Write certificate to this path (default: stdout).
     #[arg(long, short = 'o', value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// Merge new packets (UIDs and/or subkey) into an existing certificate
+    /// rather than building a fresh one.
+    ///
+    /// Use this for **subkey rotation**: re-running cert-export with a new
+    /// `--subkey-label` and the original cert preserves all existing
+    /// subkeys (so old signatures keep verifying), revocations, and UIDs,
+    /// while adding the new subkey-binding signature.
+    ///
+    /// The primary fingerprint of the existing cert must match what the
+    /// HSM key + `--creation-time` would produce — the tool refuses to
+    /// merge across different primary keys.
+    #[arg(long, value_name = "FILE")]
+    merge_cert: Option<PathBuf>,
+
+    /// Output a binary OpenPGP certificate instead of ASCII-armored.
+    #[arg(long)]
+    binary: bool,
 
     /// Key creation time to embed in the certificate (RFC 3339,
     /// e.g. 2026-04-30T16:29:30Z).
@@ -266,6 +295,126 @@ struct CertExportArgs {
 }
 
 // ---------------------------------------------------------------------------
+// cert-revoke / subkey-revoke
+// ---------------------------------------------------------------------------
+
+/// Reasons a key may be revoked, mapping 1:1 to OpenPGP RFC 9580 §5.2.3.31.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RevocationReason {
+    /// 0x00 — generic revocation, no detail given.
+    Unspecified,
+    /// 0x01 — the key is being replaced by a new one.
+    Superseded,
+    /// 0x02 — the secret material is believed to be compromised.
+    Compromised,
+    /// 0x03 — the key is no longer used (and not replaced).
+    Retired,
+}
+
+impl From<RevocationReason> for sequoia_openpgp::types::ReasonForRevocation {
+    fn from(r: RevocationReason) -> Self {
+        use sequoia_openpgp::types::ReasonForRevocation as R;
+        match r {
+            RevocationReason::Unspecified => R::Unspecified,
+            RevocationReason::Superseded => R::KeySuperseded,
+            RevocationReason::Compromised => R::KeyCompromised,
+            RevocationReason::Retired => R::KeyRetired,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct CertRevokeArgs {
+    #[command(flatten)]
+    key: KeySelectionArgs,
+
+    #[command(flatten)]
+    auth: AuthArgs,
+
+    /// Primary key creation time used to derive the OpenPGP fingerprint.
+    /// Must match the value used during cert-export so the revocation
+    /// targets the right key.  Defaults to Unix epoch.
+    #[arg(long, value_name = "TIMESTAMP")]
+    creation_time: Option<String>,
+
+    /// Revocation reason code.
+    #[arg(long, value_enum, value_name = "REASON")]
+    reason: RevocationReason,
+
+    /// Free-form human-readable message embedded in the revocation.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    message: String,
+
+    /// Time the revocation takes effect (RFC 3339).  Defaults to now.
+    #[arg(long, value_name = "TIMESTAMP")]
+    revocation_time: Option<String>,
+
+    /// Write revocation to this path (default: stdout).
+    #[arg(long, short = 'o', value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Output a binary OpenPGP signature packet instead of ASCII-armored.
+    #[arg(long)]
+    binary: bool,
+}
+
+#[derive(clap::Args)]
+struct SubkeyRevokeArgs {
+    #[command(flatten)]
+    key: KeySelectionArgs,
+
+    #[command(flatten)]
+    auth: AuthArgs,
+
+    /// Primary key creation time (RFC 3339).
+    #[arg(long, value_name = "TIMESTAMP")]
+    creation_time: Option<String>,
+
+    // ── Subkey selectors (mirror cert-export) ──────────────────────────
+    #[arg(long, value_name = "URI", group = "subkey_selector")]
+    subkey_uri: Option<String>,
+    #[arg(long, value_name = "LABEL", group = "subkey_selector")]
+    subkey_label: Option<String>,
+    #[arg(long, value_name = "HEX", group = "subkey_selector")]
+    subkey_id: Option<String>,
+    #[arg(long, group = "subkey_selector")]
+    subkey_auto: bool,
+
+    #[arg(
+        long,
+        env = "SQ_PKCS11_SUBKEY_PIN",
+        group = "subkey_auth",
+        requires = "subkey_selector"
+    )]
+    subkey_pin: Option<String>,
+    #[arg(long, group = "subkey_auth", requires = "subkey_selector")]
+    subkey_ocs: bool,
+
+    /// Subkey creation time (RFC 3339).  Must match what was used in
+    /// the cert-export that produced this subkey.
+    #[arg(long, value_name = "TIMESTAMP", requires = "subkey_selector")]
+    subkey_creation_time: Option<String>,
+
+    /// Revocation reason code.
+    #[arg(long, value_enum, value_name = "REASON")]
+    reason: RevocationReason,
+
+    /// Free-form human-readable message embedded in the revocation.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    message: String,
+
+    /// Time the revocation takes effect (RFC 3339).  Defaults to now.
+    #[arg(long, value_name = "TIMESTAMP")]
+    revocation_time: Option<String>,
+
+    #[arg(long, short = 'o', value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    #[arg(long)]
+    binary: bool,
+}
+
+// ---------------------------------------------------------------------------
 // list-keys
 // ---------------------------------------------------------------------------
 
@@ -295,39 +444,97 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Sign(args) => cmd_sign(&pkcs11, &module, args),
         Command::CertExport(args) => cmd_cert_export(&pkcs11, &module, args),
+        Command::CertRevoke(args) => cmd_cert_revoke(&pkcs11, &module, args),
+        Command::SubkeyRevoke(args) => cmd_subkey_revoke(&pkcs11, &module, args),
         Command::ListKeys(args) => cmd_list_keys(&pkcs11, args),
+    }
+}
+
+/// Common interface over args structs that carry a subkey selector +
+/// subkey auth pair (cert-export and subkey-revoke).
+trait HasSubkeyArgs {
+    fn subkey_uri(&self) -> Option<&str>;
+    fn subkey_label(&self) -> Option<&str>;
+    fn subkey_id(&self) -> Option<&str>;
+    fn subkey_auto(&self) -> bool;
+    fn subkey_pin(&self) -> Option<&str>;
+    fn subkey_ocs(&self) -> bool;
+}
+
+impl HasSubkeyArgs for CertExportArgs {
+    fn subkey_uri(&self) -> Option<&str> {
+        self.subkey_uri.as_deref()
+    }
+    fn subkey_label(&self) -> Option<&str> {
+        self.subkey_label.as_deref()
+    }
+    fn subkey_id(&self) -> Option<&str> {
+        self.subkey_id.as_deref()
+    }
+    fn subkey_auto(&self) -> bool {
+        self.subkey_auto
+    }
+    fn subkey_pin(&self) -> Option<&str> {
+        self.subkey_pin.as_deref()
+    }
+    fn subkey_ocs(&self) -> bool {
+        self.subkey_ocs
+    }
+}
+
+impl HasSubkeyArgs for SubkeyRevokeArgs {
+    fn subkey_uri(&self) -> Option<&str> {
+        self.subkey_uri.as_deref()
+    }
+    fn subkey_label(&self) -> Option<&str> {
+        self.subkey_label.as_deref()
+    }
+    fn subkey_id(&self) -> Option<&str> {
+        self.subkey_id.as_deref()
+    }
+    fn subkey_auto(&self) -> bool {
+        self.subkey_auto
+    }
+    fn subkey_pin(&self) -> Option<&str> {
+        self.subkey_pin.as_deref()
+    }
+    fn subkey_ocs(&self) -> bool {
+        self.subkey_ocs
     }
 }
 
 /// Resolve the subkey key selector from CLI args.
 ///
-/// Returns `None` if no subkey selector was provided (single-key cert).
-fn resolve_subkey_selector(args: &CertExportArgs) -> anyhow::Result<Option<KeySelector>> {
-    if let Some(uri) = &args.subkey_uri {
+/// Returns `None` if no subkey selector was provided.
+fn resolve_subkey_selector<A: HasSubkeyArgs>(args: &A) -> anyhow::Result<Option<KeySelector>> {
+    if let Some(uri) = args.subkey_uri() {
         return Ok(Some(KeySelector::Uri(uri.parse()?)));
     }
-    if let Some(label) = &args.subkey_label {
-        return Ok(Some(KeySelector::Label(label.clone())));
+    if let Some(label) = args.subkey_label() {
+        return Ok(Some(KeySelector::Label(label.to_owned())));
     }
-    if let Some(id_hex) = &args.subkey_id {
+    if let Some(id_hex) = args.subkey_id() {
         let bytes =
             hex::decode(id_hex).with_context(|| format!("invalid hex in --subkey-id: {id_hex}"))?;
         return Ok(Some(KeySelector::Id(bytes)));
     }
-    if args.subkey_auto {
+    if args.subkey_auto() {
         return Ok(Some(KeySelector::Auto));
     }
     Ok(None)
 }
 
 /// Build a `LoginMode` for the subkey from --subkey-pin / --subkey-ocs.
-fn build_subkey_login<'a>(args: &'a CertExportArgs, module: &'a std::path::Path) -> LoginMode<'a> {
-    if args.subkey_ocs {
+fn build_subkey_login<'a, A: HasSubkeyArgs>(
+    args: &'a A,
+    module: &'a std::path::Path,
+) -> LoginMode<'a> {
+    if args.subkey_ocs() {
         return LoginMode::OcsQuorum {
             module_path: module,
         };
     }
-    match args.subkey_pin.as_deref() {
+    match args.subkey_pin() {
         Some(pin) => LoginMode::Pin(pin),
         None => LoginMode::None,
     }
@@ -493,22 +700,161 @@ fn cmd_cert_export(
         validity_period: subkey_validity,
     });
 
+    // ── Optionally read the existing cert for merge mode ────────────────
+    let merge_into = match &args.merge_cert {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading existing cert {}", path.display()))?;
+            Some(cert::parse_cert(&bytes)?)
+        }
+        None => None,
+    };
+
     let spec = cert::CertSpec {
         primary: primary_spec,
         subkey: subkey_spec,
         user_ids: &args.user_ids,
+        merge_into: merge_into.as_ref(),
     };
 
     let cert = cert::build_cert(spec)?;
-    let armored = cert::export_armored_cert(&cert)?;
 
-    match args.output {
-        Some(path) => {
-            std::fs::write(&path, &armored)
-                .with_context(|| format!("writing cert to {}", path.display()))?;
-            eprintln!("Certificate written to {}", path.display());
+    if args.binary {
+        let bytes = cert::export_binary_cert(&cert)?;
+        match args.output {
+            Some(path) => {
+                std::fs::write(&path, &bytes)
+                    .with_context(|| format!("writing cert to {}", path.display()))?;
+                eprintln!("Certificate written to {}", path.display());
+            }
+            None => std::io::stdout().write_all(&bytes)?,
         }
-        None => print!("{armored}"),
+    } else {
+        let armored = cert::export_armored_cert(&cert)?;
+        match args.output {
+            Some(path) => {
+                std::fs::write(&path, &armored)
+                    .with_context(|| format!("writing cert to {}", path.display()))?;
+                eprintln!("Certificate written to {}", path.display());
+            }
+            None => print!("{armored}"),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cert-revoke
+// ---------------------------------------------------------------------------
+
+fn cmd_cert_revoke(
+    pkcs11: &Pkcs11,
+    module: &std::path::Path,
+    args: CertRevokeArgs,
+) -> anyhow::Result<()> {
+    let selector = args.key.resolve()?;
+    let login = args.auth.login_mode(module);
+    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let revocation_time = match args.revocation_time.as_deref() {
+        Some(s) => parse_creation_time(Some(s))?,
+        None => std::time::SystemTime::now(),
+    };
+
+    let (session, _) = session::open_session(pkcs11, &selector, &login)?;
+    let handle = session::resolve_single_key(&session, &selector)?;
+    let mut signer = Pkcs11Signer::new(session, handle)?;
+
+    let spec = cert::CertRevocationSpec {
+        primary: cert::KeySpec {
+            signer: &mut signer,
+            creation_time,
+            validity_period: None,
+        },
+        reason: args.reason.into(),
+        message: args.message.as_bytes(),
+        revocation_time,
+    };
+
+    let sig = cert::build_cert_revocation(spec)?;
+    write_revocation_output(&sig, args.binary, args.output.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// subkey-revoke
+// ---------------------------------------------------------------------------
+
+fn cmd_subkey_revoke(
+    pkcs11: &Pkcs11,
+    module: &std::path::Path,
+    args: SubkeyRevokeArgs,
+) -> anyhow::Result<()> {
+    let primary_selector = args.key.resolve()?;
+    let primary_login = args.auth.login_mode(module);
+    let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let revocation_time = match args.revocation_time.as_deref() {
+        Some(s) => parse_creation_time(Some(s))?,
+        None => std::time::SystemTime::now(),
+    };
+
+    let subkey_selector = resolve_subkey_selector(&args)?
+        .ok_or_else(|| anyhow::anyhow!("subkey-revoke requires a subkey selector"))?;
+    let subkey_login = build_subkey_login(&args, module);
+    let subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
+
+    let (primary_session, _) = session::open_session(pkcs11, &primary_selector, &primary_login)?;
+    let primary_handle = session::resolve_single_key(&primary_session, &primary_selector)?;
+    let mut primary_signer = Pkcs11Signer::new(primary_session, primary_handle)?;
+
+    let (sk_session, _) = session::open_session(pkcs11, &subkey_selector, &subkey_login)?;
+    let sk_handle = session::resolve_single_key(&sk_session, &subkey_selector)?;
+    let mut subkey_signer = Pkcs11Signer::new(sk_session, sk_handle)?;
+
+    let spec = cert::SubkeyRevocationSpec {
+        primary: cert::KeySpec {
+            signer: &mut primary_signer,
+            creation_time: primary_creation_time,
+            validity_period: None,
+        },
+        subkey: cert::KeySpec {
+            signer: &mut subkey_signer,
+            creation_time: subkey_creation_time,
+            validity_period: None,
+        },
+        reason: args.reason.into(),
+        message: args.message.as_bytes(),
+        revocation_time,
+    };
+
+    let sig = cert::build_subkey_revocation(spec)?;
+    write_revocation_output(&sig, args.binary, args.output.as_deref())
+}
+
+/// Shared output handler for cert-revoke and subkey-revoke.
+fn write_revocation_output(
+    sig: &sequoia_openpgp::packet::Signature,
+    binary: bool,
+    output: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if binary {
+        let bytes = cert::export_binary_signature(sig)?;
+        match output {
+            Some(path) => {
+                std::fs::write(path, &bytes)
+                    .with_context(|| format!("writing revocation to {}", path.display()))?;
+                eprintln!("Revocation written to {}", path.display());
+            }
+            None => std::io::stdout().write_all(&bytes)?,
+        }
+    } else {
+        let armored = cert::export_armored_signature(sig)?;
+        match output {
+            Some(path) => {
+                std::fs::write(path, &armored)
+                    .with_context(|| format!("writing revocation to {}", path.display()))?;
+                eprintln!("Revocation written to {}", path.display());
+            }
+            None => print!("{armored}"),
+        }
     }
     Ok(())
 }

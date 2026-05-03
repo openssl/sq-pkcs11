@@ -11,6 +11,10 @@ PKCS#11 v2.40+ module that supports the algorithms listed below.
 
 - Detached OpenPGP signatures (ASCII-armored or binary)
 - OpenPGP certificate construction from an HSM-backed public key
+- Two-tier certificates (long-term Certify-only primary + signing subkey)
+- Subkey rotation: re-export with `--merge-cert` to add a new subkey
+  while preserving every existing subkey, UID, and historical signature
+- Standalone primary-key and subkey revocation certificates
 - PKCS#11 key selection by URI (RFC 7512), `CKA_LABEL`, `CKA_ID`, or auto
 - Three authentication modes: module-protected (no login), softcard /
   single-card OCS (PIN), and nShield K/N quorum OCS (`C_LoginBegin` /
@@ -169,6 +173,38 @@ To extend a key beyond its expiry, re-run `cert-export` with the same
 `--creation-time` and a longer `--validity-period`, then redistribute
 the cert.
 
+### Rotating the signing subkey (`--merge-cert`)
+
+When a signing subkey reaches end-of-life or you want to introduce a
+fresh one without retiring the old one immediately, run `cert-export`
+in **merge mode**.  This preserves every existing subkey, UID, and
+revocation in the input cert and adds the new subkey-binding signature
+on top:
+
+```sh
+./sq-pkcs11 cert-export \
+  --merge-cert      release.asc \
+  --key-label       openssl-release-primary \
+  --subkey-label    openssl-release-sign-2027 \
+  --creation-time           2026-05-01T00:00:00Z \
+  --subkey-creation-time    2027-05-01T00:00:00Z \
+  --subkey-validity-period  2y \
+  --output          release-v2.asc
+```
+
+Why preserve old subkeys?  Signatures made by them remain verifiable
+forever as long as the cert advertises the subkey, so retiring an old
+subkey by *deleting* it from the cert would invalidate every release
+signature ever made with it.  The right pattern is to **expire** an old
+subkey (its `--subkey-validity-period` lapses, so it can't make new
+signatures) but **leave it in the published certificate** so historical
+signatures keep verifying.  When the key is genuinely compromised, also
+issue a subkey revocation (below).
+
+The tool refuses to merge if the input cert's primary fingerprint
+doesn't match the HSM-derived primary — i.e. you cannot accidentally
+merge a new subkey into the wrong cert.
+
 ### Signing a file
 
 ```sh
@@ -187,6 +223,71 @@ Verify with GnuPG:
 gpg --import release.asc
 gpg --verify openssl-3.6.0.tar.gz.asc openssl-3.6.0.tar.gz
 ```
+
+### Revoking a primary key or subkey
+
+Use `cert-revoke` to retire the entire certificate, or `subkey-revoke`
+to retire just one subkey.  Both produce a standalone OpenPGP
+revocation signature that any verifier can import alongside the cert
+to mark the key as revoked.
+
+Primary-key revocation (entire cert is dead):
+
+```sh
+./sq-pkcs11 cert-revoke \
+  --key-label     openssl-release-primary --ocs \
+  --creation-time 2026-05-01T00:00:00Z \
+  --reason        compromised \
+  --message       "primary HSM was decommissioned" \
+  --output        release-revocation.asc
+```
+
+Subkey revocation (cert remains valid; one subkey is retired):
+
+```sh
+./sq-pkcs11 subkey-revoke \
+  --key-label              openssl-release-primary --ocs \
+  --subkey-label           openssl-release-sign-2026 \
+  --creation-time          2026-05-01T00:00:00Z \
+  --subkey-creation-time   2026-05-01T00:00:00Z \
+  --reason                 superseded \
+  --message                "rotated to openssl-release-sign-2027" \
+  --output                 sign-2026-revocation.asc
+```
+
+`--reason` accepts:
+
+| Value | OpenPGP code | Use when |
+|---|---|---|
+| `compromised` | 0x02 | secret material is known or believed leaked |
+| `superseded`  | 0x01 | a new key is taking the place of the old one |
+| `retired`     | 0x03 | the key is being permanently retired and not replaced |
+| `unspecified` | 0x00 | none of the above applies |
+
+The choice affects how verifiers treat past signatures: `compromised`
+implies signatures made by the key may have been forged and should be
+treated with suspicion; `superseded`/`retired` mean past signatures
+remain trustworthy.  Pick `compromised` only when warranted.
+
+`--revocation-time` (RFC 3339) defaults to the current time.  Setting
+it explicitly is rare but useful when reissuing a previously-prepared
+revocation certificate.
+
+The output is the **revocation only** — a standalone signature packet
+in `PUBLIC KEY BLOCK` armor.  Distribution is the same as for the
+public certificate: publish to keyservers and your project website,
+where verifiers fetch and import it:
+
+```sh
+gpg --import release.asc
+gpg --import release-revocation.asc
+gpg -k     # primary now shown as [revoked]
+```
+
+For day-to-day operations, **keep old expired and superseded subkeys
+in the published certificate**.  Removing a subkey from the cert
+invalidates every signature ever made with it; expiring or revoking it
+prevents future use without touching the historical record.
 
 ## Stable fingerprints: `--creation-time`
 
