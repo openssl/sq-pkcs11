@@ -287,6 +287,7 @@ pub fn export_binary_cert(cert: &Cert) -> Result<Vec<u8>> {
 /// Uses `PUBLIC KEY BLOCK` armor and a `Comment` header matching the GnuPG
 /// `--gen-revoke` convention so importers display a clear hint.
 pub fn export_armored_signature(sig: &Signature) -> Result<String> {
+    let packet = Packet::from(sig.clone());
     let mut buf = Vec::new();
     {
         let mut writer = armor::Writer::with_headers(
@@ -295,7 +296,7 @@ pub fn export_armored_signature(sig: &Signature) -> Result<String> {
             vec![("Comment", "This is a revocation certificate")],
         )
         .map_err(|e| Error::Other(anyhow::anyhow!("armor writer init: {e}")))?;
-        sig.serialize(&mut writer)?;
+        packet.serialize(&mut writer)?;
         writer
             .finalize()
             .map_err(|e| Error::Other(anyhow::anyhow!("armor finalize: {e}")))?;
@@ -305,8 +306,9 @@ pub fn export_armored_signature(sig: &Signature) -> Result<String> {
 
 /// Serialize a single signature packet without armor.
 pub fn export_binary_signature(sig: &Signature) -> Result<Vec<u8>> {
+    let packet = Packet::from(sig.clone());
     let mut buf = Vec::new();
-    sig.serialize(&mut buf)?;
+    packet.serialize(&mut buf)?;
     Ok(buf)
 }
 
@@ -351,4 +353,88 @@ fn preferred_hashes() -> Vec<HashAlgorithm> {
 
 fn preferred_symmetric() -> Vec<SymmetricAlgorithm> {
     vec![SymmetricAlgorithm::AES256, SymmetricAlgorithm::AES128]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sequoia_openpgp::cert::{CertBuilder, CipherSuite};
+    use sequoia_openpgp::parse::PacketParser;
+    use sequoia_openpgp::parse::PacketParserResult;
+
+    /// Generate a software cert with a free revocation signature, without
+    /// touching any HSM. Used to exercise the export helpers in isolation.
+    fn software_revocation() -> Signature {
+        let (_cert, revocation) = CertBuilder::new()
+            .set_cipher_suite(CipherSuite::P256)
+            .add_userid("Export Test <export@example.com>")
+            .generate()
+            .expect("software cert generation");
+        revocation
+    }
+
+    /// Sequoia's PacketParser is what `sq inspect` uses; if the stream is not
+    /// a properly framed OpenPGP packet (i.e. the CTB byte is missing) it
+    /// fails with the same "MSB of ptag not set" error a user would see.
+    fn assert_parses_as_single_signature(bytes: &[u8]) {
+        let mut ppr = PacketParser::from_bytes(bytes).expect("PacketParser init");
+        let mut count = 0;
+        while let PacketParserResult::Some(pp) = ppr {
+            let (packet, next) = pp.recurse().expect("packet recurse");
+            assert!(
+                matches!(packet, Packet::Signature(_)),
+                "expected Signature packet, got {packet:?}"
+            );
+            count += 1;
+            ppr = next;
+        }
+        assert_eq!(count, 1, "expected exactly one packet, got {count}");
+    }
+
+    #[test]
+    fn export_binary_signature_is_a_framed_packet() {
+        let sig = software_revocation();
+        let bytes = export_binary_signature(&sig).expect("export_binary_signature");
+
+        // The first byte of any OpenPGP packet is a CTB whose MSB must be set.
+        // The original bug serialised the signature *body* (starting with the
+        // v4 version byte 0x04, MSB clear), tripping `sq inspect`.
+        assert!(
+            !bytes.is_empty() && bytes[0] & 0x80 != 0,
+            "first byte must have MSB set (CTB framing); got 0x{:02x}",
+            bytes.first().copied().unwrap_or(0)
+        );
+
+        assert_parses_as_single_signature(&bytes);
+    }
+
+    #[test]
+    fn export_armored_signature_dearmors_to_a_framed_packet() {
+        let sig = software_revocation();
+        let armored = export_armored_signature(&sig).expect("export_armored_signature");
+
+        // Armor framing is GnuPG-compatible (PUBLIC KEY BLOCK + comment).
+        assert!(
+            armored.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+            "missing armor BEGIN line"
+        );
+        assert!(
+            armored.contains("Comment: This is a revocation certificate"),
+            "missing revocation Comment header"
+        );
+
+        // The dearmored body must itself be a properly framed packet stream.
+        let mut ppr = PacketParser::from_bytes(armored.as_bytes()).expect("PacketParser dearmor");
+        let mut count = 0;
+        while let PacketParserResult::Some(pp) = ppr {
+            let (packet, next) = pp.recurse().expect("packet recurse");
+            assert!(
+                matches!(packet, Packet::Signature(_)),
+                "expected Signature packet, got {packet:?}"
+            );
+            count += 1;
+            ppr = next;
+        }
+        assert_eq!(count, 1, "expected exactly one packet, got {count}");
+    }
 }

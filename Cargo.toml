@@ -36,3 +36,8 @@ libloading = "0.8"
 assert_cmd = "2"
 tempfile   = "3"
 dotenvy    = "0.15"
+
+# Strict OpenPGP packet parsing for integration-test assertions on cert-revoke
+# and subkey-revoke output. Same crate + features as [dependencies], so Cargo
+# unifies the build.
+sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-openssl"] }

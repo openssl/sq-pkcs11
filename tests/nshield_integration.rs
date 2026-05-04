@@ -748,6 +748,77 @@ fn merge_cert_preserves_old_subkey() {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation file framing
+// ---------------------------------------------------------------------------
+//
+// Regression test for the "Malformed CTB: MSB of ptag (0b00000100) not set"
+// bug.  GnuPG is lenient enough to import a Signature serialized as just its
+// body (no CTB), so the existing import-and-revoked-flag tests passed despite
+// the bug.  Sequoia's PacketParser — the same parser `sq inspect` uses — is
+// strict.  Verify both `cert-revoke` and `subkey-revoke` outputs round-trip
+// through it.
+
+#[test]
+fn revocation_files_are_proper_openpgp_packets() {
+    use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
+    use sequoia_openpgp::Packet;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_revocation = tmp.path().join("cert-revocation.asc");
+    let subkey_revocation = tmp.path().join("subkey-revocation.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "superseded"])
+        .args(["--message", "framing regression"])
+        .args(["--output"])
+        .arg(&cert_revocation)
+        .assert()
+        .success();
+
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--message", "framing regression"])
+        .args(["--output"])
+        .arg(&subkey_revocation)
+        .assert()
+        .success();
+
+    for (path, label) in [
+        (&cert_revocation, "cert-revoke"),
+        (&subkey_revocation, "subkey-revoke"),
+    ] {
+        let bytes = std::fs::read(path).expect("read revocation");
+        let mut ppr = PacketParser::from_bytes(&bytes)
+            .unwrap_or_else(|e| panic!("{label} output is not a parseable OpenPGP stream: {e}"));
+        let mut count = 0;
+        while let PacketParserResult::Some(pp) = ppr {
+            let (packet, next) = pp
+                .recurse()
+                .unwrap_or_else(|e| panic!("{label}: packet recurse failed: {e}"));
+            assert!(
+                matches!(packet, Packet::Signature(_)),
+                "{label}: expected Signature packet, got {packet:?}"
+            );
+            count += 1;
+            ppr = next;
+        }
+        assert_eq!(
+            count, 1,
+            "{label}: expected exactly one packet, got {count}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tiny extension trait so we can write `.assert_success()` on std::Command.
 // ---------------------------------------------------------------------------
 
