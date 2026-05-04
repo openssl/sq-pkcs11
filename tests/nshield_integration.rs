@@ -819,6 +819,835 @@ fn revocation_files_are_proper_openpgp_packets() {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers for the cert/signature inspection tests below.
+// ---------------------------------------------------------------------------
+
+fn parse_cert_file(path: &Path) -> sequoia_openpgp::Cert {
+    use sequoia_openpgp::parse::Parse;
+    let bytes = std::fs::read(path).expect("read cert file");
+    sequoia_openpgp::Cert::from_bytes(&bytes)
+        .unwrap_or_else(|e| panic!("parse cert {}: {e}", path.display()))
+}
+
+fn parse_signature_file(path: &Path) -> sequoia_openpgp::packet::Signature {
+    use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
+    use sequoia_openpgp::Packet;
+    let bytes = std::fs::read(path).expect("read signature file");
+    let mut ppr = PacketParser::from_bytes(&bytes)
+        .unwrap_or_else(|e| panic!("parse signature {}: {e}", path.display()));
+    let mut found: Option<sequoia_openpgp::packet::Signature> = None;
+    while let PacketParserResult::Some(pp) = ppr {
+        let (packet, next) = pp.recurse().expect("packet recurse");
+        if let Packet::Signature(s) = packet {
+            assert!(found.is_none(), "expected one Signature packet, got more");
+            found = Some(s);
+        }
+        ppr = next;
+    }
+    found.unwrap_or_else(|| panic!("no Signature packet in {}", path.display()))
+}
+
+/// Use `sq-pkcs11 list-keys` to discover the CKA_ID for a given CKA_LABEL.
+/// Output line format: `  label="..."  id=HEX  type=...`.
+fn cka_id_for_label(env: &TestEnv, label: &str) -> String {
+    let assert = sq_pkcs11(env).arg("list-keys").assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("list-keys stdout is UTF-8");
+    let needle = format!("label={label:?}");
+    for line in stdout.lines() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        if let Some(id_field) = line.split("id=").nth(1) {
+            if let Some(id) = id_field.split_whitespace().next() {
+                return id.to_string();
+            }
+        }
+    }
+    panic!("could not find id for label {label} in list-keys output:\n{stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// Two-tier capability invariants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_tier_cert_has_only_certify_primary_and_signing_subkey() {
+    use sequoia_openpgp::policy::StandardPolicy;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Caps Test <caps@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--validity-period", "10y"])
+        .args(["--subkey-validity-period", "1y"])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    let cert = parse_cert_file(&cert_path);
+    let policy = StandardPolicy::new();
+    let valid = cert.with_policy(&policy, None).expect("cert is valid");
+
+    let primary_flags = valid
+        .primary_key()
+        .key_flags()
+        .expect("primary has key flags");
+    assert!(
+        primary_flags.for_certification(),
+        "primary must have certification capability"
+    );
+    assert!(
+        !primary_flags.for_signing(),
+        "primary must not have signing capability in two-tier cert"
+    );
+    assert!(
+        !primary_flags.for_storage_encryption() && !primary_flags.for_transport_encryption(),
+        "primary must not have any encryption capability"
+    );
+    assert!(
+        !primary_flags.for_authentication(),
+        "primary must not have authentication capability"
+    );
+
+    let subkeys: Vec<_> = valid.keys().subkeys().collect();
+    assert_eq!(
+        subkeys.len(),
+        1,
+        "expected exactly one subkey, found {}",
+        subkeys.len()
+    );
+    let sub_flags = subkeys[0].key_flags().expect("subkey has key flags");
+    assert!(
+        sub_flags.for_signing(),
+        "subkey must have signing capability"
+    );
+    assert!(
+        !sub_flags.for_certification(),
+        "subkey must not have certification capability"
+    );
+    assert!(
+        !sub_flags.for_storage_encryption() && !sub_flags.for_transport_encryption(),
+        "subkey must not have any encryption capability"
+    );
+    assert!(
+        !sub_flags.for_authentication(),
+        "subkey must not have authentication capability"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Validity-period encoding (long primary, short subkey)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validity_periods_are_recorded_in_signatures() {
+    use sequoia_openpgp::policy::StandardPolicy;
+    use std::time::Duration;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let home = fresh_gpg_home(&tmp);
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Validity Two-Tier <vt@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--validity-period", "10y"])
+        .args(["--subkey-validity-period", "1y"])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    // ── Sequoia view: signature subpackets carry the durations we asked for.
+    let cert = parse_cert_file(&cert_path);
+    let policy = StandardPolicy::new();
+    let valid = cert.with_policy(&policy, None).expect("cert is valid");
+
+    let primary_validity = valid
+        .primary_key()
+        .key_validity_period()
+        .expect("primary key_validity_period subpacket present");
+    let ten_years = Duration::from_secs((10.0 * 365.25 * 86_400.0) as u64);
+    let one_year = Duration::from_secs((365.25 * 86_400.0) as u64);
+    // 1-day tolerance covers any rounding inside the years→seconds conversion.
+    let tolerance = Duration::from_secs(86_400);
+    assert!(
+        primary_validity.abs_diff(ten_years) <= tolerance,
+        "primary validity {primary_validity:?} is not ~10y (expected {ten_years:?})"
+    );
+
+    let subkey = valid.keys().subkeys().next().expect("one subkey");
+    let subkey_validity = subkey
+        .key_validity_period()
+        .expect("subkey key_validity_period subpacket present");
+    assert!(
+        subkey_validity.abs_diff(one_year) <= tolerance,
+        "subkey validity {subkey_validity:?} is not ~1y (expected {one_year:?})"
+    );
+
+    // ── GPG view: both pub: and sub: lines have non-zero expiry timestamps,
+    //    and the difference between them is roughly 9 years (10y - 1y).
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&cert_path)
+        .assert_success();
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    assert!(listing.status.success());
+    let s = String::from_utf8_lossy(&listing.stdout);
+    let pub_line = s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .expect("pub: line");
+    let sub_line = s
+        .lines()
+        .find(|l| l.starts_with("sub:"))
+        .expect("sub: line");
+    let pub_expiry: u64 = pub_line
+        .split(':')
+        .nth(6)
+        .and_then(|f| f.parse().ok())
+        .expect("pub: expiry int");
+    let sub_expiry: u64 = sub_line
+        .split(':')
+        .nth(6)
+        .and_then(|f| f.parse().ok())
+        .expect("sub: expiry int");
+    assert!(pub_expiry > 0, "primary expiry must be set");
+    assert!(sub_expiry > 0, "subkey expiry must be set");
+    assert!(
+        pub_expiry > sub_expiry,
+        "primary should outlive subkey: pub_expiry={pub_expiry} sub_expiry={sub_expiry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Revocation metadata: reason, message, and revocation time round-trip.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn revocation_signature_records_reason_message_and_time() {
+    use sequoia_openpgp::types::ReasonForRevocation;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let revocation_time = "2026-07-15T12:34:56Z";
+
+    let cases = [
+        ("unspecified", ReasonForRevocation::Unspecified, "no reason"),
+        (
+            "superseded",
+            ReasonForRevocation::KeySuperseded,
+            "rotated to fresh key",
+        ),
+        (
+            "compromised",
+            ReasonForRevocation::KeyCompromised,
+            "smartcard lost in transit",
+        ),
+        (
+            "retired",
+            ReasonForRevocation::KeyRetired,
+            "service decommissioned",
+        ),
+    ];
+
+    for (cli_reason, expected_code, message) in cases {
+        let revocation = tmp.path().join(format!("rev-{cli_reason}.asc"));
+        sq_pkcs11(&env)
+            .args(["cert-revoke"])
+            .args(["--key-label", &env.ec_label])
+            .args(["--creation-time", STABLE_TIME])
+            .args(["--reason", cli_reason])
+            .args(["--message", message])
+            .args(["--revocation-time", revocation_time])
+            .args(["--output"])
+            .arg(&revocation)
+            .assert()
+            .success();
+
+        let sig = parse_signature_file(&revocation);
+
+        let (code, reason_bytes) = sig
+            .reason_for_revocation()
+            .unwrap_or_else(|| panic!("reason subpacket missing in {cli_reason} revocation"));
+        assert_eq!(code, expected_code, "reason code mismatch for {cli_reason}");
+        assert_eq!(
+            reason_bytes,
+            message.as_bytes(),
+            "reason message mismatch for {cli_reason}"
+        );
+
+        let creation = sig
+            .signature_creation_time()
+            .expect("signature creation time present");
+        let expected = humantime::parse_rfc3339(revocation_time).unwrap();
+        assert_eq!(
+            creation, expected,
+            "signature creation time mismatch for {cli_reason}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary revocation: the --binary path also produces strict-parseable
+// packets that GPG accepts and treats as revocation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn binary_revocation_outputs_are_packets_accepted_by_gpg() {
+    use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
+    use sequoia_openpgp::Packet;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let cert_revocation = tmp.path().join("cert-rev.bin");
+    let subkey_revocation = tmp.path().join("sub-rev.bin");
+    let home = fresh_gpg_home(&tmp);
+
+    // Two-tier cert so we can revoke both tiers.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Bin Revoke <br@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "superseded"])
+        .args(["--message", "binary revocation"])
+        .args(["--binary"])
+        .args(["--output"])
+        .arg(&cert_revocation)
+        .assert()
+        .success();
+
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--message", "binary revocation"])
+        .args(["--binary"])
+        .args(["--output"])
+        .arg(&subkey_revocation)
+        .assert()
+        .success();
+
+    for (path, label) in [
+        (&cert_revocation, "cert-revoke --binary"),
+        (&subkey_revocation, "subkey-revoke --binary"),
+    ] {
+        let bytes = std::fs::read(path).expect("read binary revocation");
+        // Binary output must not be ASCII-armored.
+        assert!(
+            !bytes.starts_with(b"-----BEGIN"),
+            "{label} produced armored output despite --binary"
+        );
+        // Strict parser accepts it as exactly one Signature packet.
+        let mut ppr = PacketParser::from_bytes(&bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let mut count = 0;
+        while let PacketParserResult::Some(pp) = ppr {
+            let (packet, next) = pp.recurse().expect("packet recurse");
+            assert!(
+                matches!(packet, Packet::Signature(_)),
+                "{label}: expected Signature, got {packet:?}"
+            );
+            count += 1;
+            ppr = next;
+        }
+        assert_eq!(count, 1, "{label}: expected one packet");
+    }
+
+    // GPG accepts the binary revocations and marks the appropriate tiers.
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&cert_path)
+        .assert_success();
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&cert_revocation)
+        .assert_success();
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&subkey_revocation)
+        .assert_success();
+
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    assert!(listing.status.success());
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+    let pub_line = listing_s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .expect("pub: line");
+    let pub_validity = pub_line.split(':').nth(1).unwrap_or("");
+    assert!(
+        pub_validity.contains('r'),
+        "primary should be revoked after binary cert-revoke import: {pub_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Wrong-creation-time negative cases: verifiers must reject artefacts whose
+// fingerprint cannot be matched back to the published certificate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wrong_creation_time_invalidates_signature_and_revocations() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let payload = tmp.path().join("payload.txt");
+    let signature = tmp.path().join("payload.txt.asc");
+    let bad_cert_revocation = tmp.path().join("bad-cert-rev.asc");
+    let bad_subkey_revocation = tmp.path().join("bad-subkey-rev.asc");
+    let home = fresh_gpg_home(&tmp);
+
+    let t1 = STABLE_TIME; // cert time
+    let t2 = "2027-06-15T00:00:00Z"; // wrong time
+
+    std::fs::write(&payload, b"wrong-time payload\n").unwrap();
+
+    // Build two-tier cert at T1 and import.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "WrongTime <wt@example.com>"])
+        .args(["--creation-time", t1])
+        .args(["--subkey-creation-time", t1])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+    gpg_in(&home)
+        .arg("--import")
+        .arg(&cert_path)
+        .assert_success();
+
+    // 1. Sign with subkey at T2 instead of T1 — verification must fail.
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", t2])
+        .arg(&payload)
+        .assert()
+        .success();
+    let verify = gpg_in(&home)
+        .arg("--verify")
+        .arg(&signature)
+        .arg(&payload)
+        .output()
+        .expect("gpg --verify");
+    assert!(
+        !verify.status.success(),
+        "verification must fail when sign --creation-time disagrees with cert; \
+         stderr: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    // 2. cert-revoke with creation-time T2 must not revoke the T1 primary.
+    sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--creation-time", t2])
+        .args(["--reason", "superseded"])
+        .args(["--message", "wrong-time revocation"])
+        .args(["--output"])
+        .arg(&bad_cert_revocation)
+        .assert()
+        .success();
+    // GPG may reject the import outright (mismatched issuer) or import-and-ignore.
+    // Either way, the imported public cert must not show 'r' on the pub: line.
+    let _ = gpg_in(&home)
+        .arg("--import")
+        .arg(&bad_cert_revocation)
+        .output();
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+    let pub_line = listing_s
+        .lines()
+        .find(|l| l.starts_with("pub:"))
+        .expect("pub: line");
+    let pub_validity = pub_line.split(':').nth(1).unwrap_or("");
+    assert!(
+        !pub_validity.contains('r'),
+        "primary must not be marked revoked by a T2 revocation against a T1 cert; pub: {pub_line}"
+    );
+
+    // 3. subkey-revoke with subkey creation-time T2 must not revoke the T1 subkey.
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", t1])
+        .args(["--subkey-creation-time", t2])
+        .args(["--reason", "compromised"])
+        .args(["--message", "wrong-time subkey revocation"])
+        .args(["--output"])
+        .arg(&bad_subkey_revocation)
+        .assert()
+        .success();
+    let _ = gpg_in(&home)
+        .arg("--import")
+        .arg(&bad_subkey_revocation)
+        .output();
+    let listing = gpg_in(&home)
+        .args(["--list-keys", "--with-colons"])
+        .output()
+        .expect("gpg --list-keys");
+    let listing_s = String::from_utf8_lossy(&listing.stdout);
+    let sub_line = listing_s
+        .lines()
+        .find(|l| l.starts_with("sub:"))
+        .expect("sub: line");
+    let sub_validity = sub_line.split(':').nth(1).unwrap_or("");
+    assert!(
+        !sub_validity.contains('r'),
+        "subkey must not be marked revoked by a T2 revocation against a T1 subkey; sub: {sub_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Merge guard: refuse cert-export --merge-cert when the HSM-derived primary
+// fingerprint disagrees with the existing cert's primary fingerprint.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_cert_refuses_wrong_primary_creation_time() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_v1 = tmp.path().join("cert-v1.asc");
+    let cert_v2 = tmp.path().join("cert-v2.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "MergeGuard <mg@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_v1)
+        .assert()
+        .success();
+
+    let assert = sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--merge-cert"])
+        .arg(&cert_v1)
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey2_label])
+        .args(["--creation-time", "2030-01-01T00:00:00Z"]) // wrong primary time
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_v2)
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr
+            .to_lowercase()
+            .contains("primary fingerprint mismatch"),
+        "expected 'primary fingerprint mismatch' in stderr, got: {stderr}"
+    );
+    assert!(
+        !cert_v2.exists(),
+        "merge must not write an output file when the fingerprint check fails"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Selector forms: --key-label, --key-id, --key-uri all resolve to the same
+// underlying private key.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn key_selector_forms_resolve_same_key() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let by_label = tmp.path().join("by-label.asc");
+    let by_id = tmp.path().join("by-id.asc");
+    let by_uri = tmp.path().join("by-uri.asc");
+
+    let id_hex = cka_id_for_label(&env, &env.ec_label);
+    let uri = format!("pkcs11:object={};type=private", env.ec_label);
+
+    let userid = "Selector <sel@example.com>";
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--userid", userid])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&by_label)
+        .assert()
+        .success();
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-id", &id_hex])
+        .args(["--userid", userid])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&by_id)
+        .assert()
+        .success();
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-uri", &uri])
+        .args(["--userid", userid])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&by_uri)
+        .assert()
+        .success();
+
+    let fpr_label = parse_cert_file(&by_label).fingerprint();
+    let fpr_id = parse_cert_file(&by_id).fingerprint();
+    let fpr_uri = parse_cert_file(&by_uri).fingerprint();
+    assert_eq!(fpr_label, fpr_id, "label and id must resolve same key");
+    assert_eq!(fpr_label, fpr_uri, "label and uri must resolve same key");
+}
+
+// ---------------------------------------------------------------------------
+// --auto must fail with a clear error when multiple usable keys are visible.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_selector_with_multiple_keys_fails() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+
+    let assert = sq_pkcs11(&env)
+        .args(["cert-export"])
+        .arg("--auto")
+        .args(["--userid", "Ambiguous <amb@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_lowercase();
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected 'ambiguous' in stderr when --auto sees multiple keys, got: {stderr}"
+    );
+    assert!(
+        !cert.exists(),
+        "ambiguous --auto must not produce an output cert"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// stdout output: subcommands write OpenPGP data to stdout when --output is
+// omitted, with diagnostics on stderr.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subcommands_write_to_stdout_when_output_omitted() {
+    use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
+    use sequoia_openpgp::Packet;
+
+    let env = require_env!();
+
+    // 1. cert-export (armored) — stdout starts with armor BEGIN.
+    let assert = sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--userid", "Stdout <so@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .assert()
+        .success();
+    let out = assert.get_output();
+    let stdout = String::from_utf8(out.stdout.clone()).expect("stdout UTF-8");
+    assert!(
+        stdout.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+        "armored cert-export stdout did not start with PGP armor:\n{stdout}"
+    );
+    // Diagnostics, if any, must not contain OpenPGP packet bytes on stderr.
+    assert!(
+        !out.stderr.starts_with(b"-----BEGIN") && !out.stderr.starts_with(&[0x80]),
+        "stderr leaked OpenPGP data"
+    );
+
+    // 2. cert-export --binary — stdout parses as a strict OpenPGP packet stream
+    //    containing a PublicKey packet.
+    let assert = sq_pkcs11(&env)
+        .args(["cert-export", "--binary"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--userid", "Stdout <so@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .assert()
+        .success();
+    let bytes = assert.get_output().stdout.clone();
+    assert!(
+        !bytes.starts_with(b"-----BEGIN"),
+        "--binary stdout was armored"
+    );
+    let mut ppr = PacketParser::from_bytes(&bytes).expect("parse cert-export --binary stdout");
+    let mut saw_public_key = false;
+    while let PacketParserResult::Some(pp) = ppr {
+        let (packet, next) = pp.recurse().expect("packet recurse");
+        if matches!(packet, Packet::PublicKey(_)) {
+            saw_public_key = true;
+        }
+        ppr = next;
+    }
+    assert!(saw_public_key, "binary cert-export stdout had no PublicKey");
+
+    // 3. cert-revoke — stdout is a single Signature packet (armored).
+    let assert = sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "unspecified"])
+        .args(["--message", "stdout test"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout UTF-8");
+    assert!(
+        stdout.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+        "cert-revoke stdout was not armored:\n{stdout}"
+    );
+    let mut ppr = PacketParser::from_bytes(stdout.as_bytes()).expect("dearmor cert-revoke stdout");
+    let mut sigs = 0;
+    while let PacketParserResult::Some(pp) = ppr {
+        let (packet, next) = pp.recurse().expect("packet recurse");
+        if matches!(packet, Packet::Signature(_)) {
+            sigs += 1;
+        }
+        ppr = next;
+    }
+    assert_eq!(sigs, 1, "cert-revoke stdout must be exactly one Signature");
+
+    // 4. subkey-revoke — same shape.
+    let assert = sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--reason", "unspecified"])
+        .args(["--message", "stdout test"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout UTF-8");
+    let mut ppr =
+        PacketParser::from_bytes(stdout.as_bytes()).expect("dearmor subkey-revoke stdout");
+    let mut sigs = 0;
+    while let PacketParserResult::Some(pp) = ppr {
+        let (packet, next) = pp.recurse().expect("packet recurse");
+        if matches!(packet, Packet::Signature(_)) {
+            sigs += 1;
+        }
+        ppr = next;
+    }
+    assert_eq!(
+        sigs, 1,
+        "subkey-revoke stdout must be exactly one Signature"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issuer of an artefact signature must be the subkey, not the primary.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signature_issuer_is_the_subkey_in_two_tier_cert() {
+    use sequoia_openpgp::policy::StandardPolicy;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let payload = tmp.path().join("p.txt");
+    let signature_path = tmp.path().join("p.txt.asc");
+
+    std::fs::write(&payload, b"issuer test\n").unwrap();
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Issuer <iss@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let cert = parse_cert_file(&cert_path);
+    let policy = StandardPolicy::new();
+    let valid = cert.with_policy(&policy, None).expect("cert is valid");
+    let primary_fpr = valid.primary_key().key().fingerprint();
+    let subkey_fpr = valid
+        .keys()
+        .subkeys()
+        .next()
+        .expect("subkey present")
+        .key()
+        .fingerprint();
+
+    let sig = parse_signature_file(&signature_path);
+    let issuer_fprs: Vec<_> = sig.issuer_fingerprints().cloned().collect();
+    assert!(
+        issuer_fprs.iter().any(|f| f == &subkey_fpr),
+        "signature issuer must be the subkey {subkey_fpr}, got {issuer_fprs:?}"
+    );
+    assert!(
+        issuer_fprs.iter().all(|f| f != &primary_fpr),
+        "signature must not be issued by the primary {primary_fpr}, got {issuer_fprs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tiny extension trait so we can write `.assert_success()` on std::Command.
 // ---------------------------------------------------------------------------
 
