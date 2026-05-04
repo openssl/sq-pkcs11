@@ -7,6 +7,11 @@ Built primarily for the OpenSSL release-signing workflow on Entrust nShield
 HSMs in FIPS 140-3 mode, but the standard subcommands work with any
 PKCS#11 v2.40+ module that supports the algorithms listed below.
 
+For nShield-specific operational notes — the OCS quorum login extension,
+vendor `CKA_NFKM_*` attributes, recipes for reading the Security World
+key-generation timestamp, and FIPS 140-3 algorithm constraints — see
+[`NSHIELD.md`](NSHIELD.md).
+
 ## Features
 
 - Detached OpenPGP signatures (ASCII-armored or binary)
