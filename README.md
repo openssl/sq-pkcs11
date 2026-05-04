@@ -93,7 +93,7 @@ OCS slots. For module-protected keys, any of the three forms works.
 | Mode | How |
 |---|---|
 | Module-protected | no auth flag — login is not required |
-| Softcard / single-card OCS | `--pin <pass>` or `SQ_PKCS11_PIN` env var |
+| Softcard / single-card OCS | `--pin-file <path>` or `SQ_PKCS11_PIN` env var |
 | nShield K/N quorum OCS | `--ocs` — the tool prompts per card via `rpassword` |
 
 For OCS quorum login, the operator(s) must insert their cards into
@@ -143,8 +143,12 @@ Each tier authenticates independently:
 
 | Flag | Tier |
 |---|---|
-| `--pin` / `--ocs` | primary |
-| `--subkey-pin` / `--subkey-ocs` | subkey |
+| `--pin-file` / `--ocs` | primary |
+| `--subkey-pin-file` / `--subkey-ocs` | subkey |
+
+(Passphrases are read from a file or the `SQ_PKCS11_PIN` /
+`SQ_PKCS11_SUBKEY_PIN` env vars; there is no `--pin <PASS>` value
+flag — that would expose secrets through `ps` and shell history.)
 
 Omitting both auth flags on a tier means the corresponding key is
 module-protected (no login required).
@@ -362,9 +366,10 @@ hashes the OpenPGP-formatted data, the digest is wrapped in a DER
 
 ## Limitations
 
-- **Out of scope**: key generation, key import/export, key deletion,
-  certificate revocation. Use your HSM's own tooling (`generatekey`,
-  `createocs`, `ppmk` on nShield).
+- **Out of scope**: key generation, key import/export, key deletion.
+  Use your HSM's own tooling (`generatekey`, `createocs`, `ppmk` on
+  nShield).  Certificate-level revocation (cert and subkey) **is** in
+  scope — see `cert-revoke` / `subkey-revoke`.
 - **No Ed25519 / EdDSA**: nShield's FIPS 140-3 mode does not approve
   Ed25519 in releases before V13.7, and many other HSMs don't expose it.
   For broad portability the tool sticks to NIST-curve ECDSA and RSA.
@@ -381,7 +386,7 @@ hashes the OpenPGP-formatted data, the digest is wrapped in a DER
   (`gpg --send-keys`, `hkp-tool`, `sq keyring publish`, ...).
 - **OCS quorum is nShield-specific**: `C_LoginBegin`/`C_LoginNext`/
   `C_LoginEnd` are vendor extensions. On non-nShield HSMs use
-  `--pin` (single-card OCS works that way) or your vendor's preload
+  `--pin-file` (single-card OCS works that way) or your vendor's preload
   equivalent.
 - **HSM-dependent code is not unit-tested**: the actual signing path,
   slot/login logic, and certificate assembly require a real HSM. They

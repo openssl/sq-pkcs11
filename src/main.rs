@@ -97,11 +97,16 @@ impl KeySelectionArgs {
 
 #[derive(clap::Args)]
 struct AuthArgs {
-    /// PIN / passphrase for softcard- or single-card OCS-protected keys.
-    /// Omit entirely for module-protected keys.
-    /// Prefer the SQ_PKCS11_PIN env var to avoid the value in process listings.
-    #[arg(long, env = "SQ_PKCS11_PIN", group = "auth")]
-    pin: Option<String>,
+    /// Read the softcard / K=1 OCS passphrase from this file (single line,
+    /// trailing whitespace trimmed).  Omit entirely for module-protected
+    /// keys.
+    ///
+    /// As an alternative, the `SQ_PKCS11_PIN` environment variable is read
+    /// when this flag is absent.  There is no `--pin <PASS>` value flag
+    /// because passphrases on the command line leak through process
+    /// listings and shell history.
+    #[arg(long, value_name = "FILE", group = "auth")]
+    pin_file: Option<PathBuf>,
 
     /// Interactive OCS quorum login (K > 1 card sets).
     /// The tool will prompt for each card's passphrase in turn using the
@@ -111,17 +116,32 @@ struct AuthArgs {
 }
 
 impl AuthArgs {
-    fn login_mode<'a>(&'a self, module: &'a std::path::Path) -> LoginMode<'a> {
+    fn login_mode<'a>(&'a self, module: &'a std::path::Path) -> anyhow::Result<LoginMode<'a>> {
         if self.ocs {
-            return LoginMode::OcsQuorum {
+            return Ok(LoginMode::OcsQuorum {
                 module_path: module,
-            };
+            });
         }
-        match self.pin.as_deref() {
-            Some(pin) => LoginMode::Pin(pin),
-            None => LoginMode::None,
+        if let Some(path) = &self.pin_file {
+            return Ok(LoginMode::Pin(read_pin_file(path)?));
         }
+        if let Ok(pin) = std::env::var("SQ_PKCS11_PIN") {
+            return Ok(LoginMode::Pin(pin));
+        }
+        Ok(LoginMode::None)
     }
+}
+
+/// Read a passphrase from a file: drop the trailing newline (if any),
+/// reject totally-empty contents.
+fn read_pin_file(path: &std::path::Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading pin file {}", path.display()))?;
+    let pin = raw.trim_end_matches(['\n', '\r']).to_string();
+    if pin.is_empty() {
+        anyhow::bail!("pin file {} is empty", path.display());
+    }
+    Ok(pin)
 }
 
 // ---------------------------------------------------------------------------
@@ -262,14 +282,17 @@ struct CertExportArgs {
     #[arg(long, group = "subkey_selector")]
     subkey_auto: bool,
 
-    /// PIN / passphrase for the subkey, if it is softcard- or single-card-OCS-protected.
+    /// File containing the subkey passphrase, if it is softcard- or
+    /// single-card-OCS-protected.  Same semantics as --pin-file.  The
+    /// `SQ_PKCS11_SUBKEY_PIN` environment variable is read when this flag
+    /// is absent.  No `--subkey-pin <PASS>` value flag — see --pin-file.
     #[arg(
         long,
-        env = "SQ_PKCS11_SUBKEY_PIN",
+        value_name = "FILE",
         group = "subkey_auth",
         requires = "subkey_selector"
     )]
-    subkey_pin: Option<String>,
+    subkey_pin_file: Option<PathBuf>,
 
     /// Use nShield K/N quorum login for the subkey.
     #[arg(long, group = "subkey_auth", requires = "subkey_selector")]
@@ -380,13 +403,15 @@ struct SubkeyRevokeArgs {
     #[arg(long, group = "subkey_selector")]
     subkey_auto: bool,
 
+    /// File containing the subkey passphrase.  Same semantics as
+    /// --pin-file; `SQ_PKCS11_SUBKEY_PIN` env var read when absent.
     #[arg(
         long,
-        env = "SQ_PKCS11_SUBKEY_PIN",
+        value_name = "FILE",
         group = "subkey_auth",
         requires = "subkey_selector"
     )]
-    subkey_pin: Option<String>,
+    subkey_pin_file: Option<PathBuf>,
     #[arg(long, group = "subkey_auth", requires = "subkey_selector")]
     subkey_ocs: bool,
 
@@ -457,7 +482,7 @@ trait HasSubkeyArgs {
     fn subkey_label(&self) -> Option<&str>;
     fn subkey_id(&self) -> Option<&str>;
     fn subkey_auto(&self) -> bool;
-    fn subkey_pin(&self) -> Option<&str>;
+    fn subkey_pin_file(&self) -> Option<&std::path::Path>;
     fn subkey_ocs(&self) -> bool;
 }
 
@@ -474,8 +499,8 @@ impl HasSubkeyArgs for CertExportArgs {
     fn subkey_auto(&self) -> bool {
         self.subkey_auto
     }
-    fn subkey_pin(&self) -> Option<&str> {
-        self.subkey_pin.as_deref()
+    fn subkey_pin_file(&self) -> Option<&std::path::Path> {
+        self.subkey_pin_file.as_deref()
     }
     fn subkey_ocs(&self) -> bool {
         self.subkey_ocs
@@ -495,8 +520,8 @@ impl HasSubkeyArgs for SubkeyRevokeArgs {
     fn subkey_auto(&self) -> bool {
         self.subkey_auto
     }
-    fn subkey_pin(&self) -> Option<&str> {
-        self.subkey_pin.as_deref()
+    fn subkey_pin_file(&self) -> Option<&std::path::Path> {
+        self.subkey_pin_file.as_deref()
     }
     fn subkey_ocs(&self) -> bool {
         self.subkey_ocs
@@ -528,16 +553,19 @@ fn resolve_subkey_selector<A: HasSubkeyArgs>(args: &A) -> anyhow::Result<Option<
 fn build_subkey_login<'a, A: HasSubkeyArgs>(
     args: &'a A,
     module: &'a std::path::Path,
-) -> LoginMode<'a> {
+) -> anyhow::Result<LoginMode<'a>> {
     if args.subkey_ocs() {
-        return LoginMode::OcsQuorum {
+        return Ok(LoginMode::OcsQuorum {
             module_path: module,
-        };
+        });
     }
-    match args.subkey_pin() {
-        Some(pin) => LoginMode::Pin(pin),
-        None => LoginMode::None,
+    if let Some(path) = args.subkey_pin_file() {
+        return Ok(LoginMode::Pin(read_pin_file(path)?));
     }
+    if let Ok(pin) = std::env::var("SQ_PKCS11_SUBKEY_PIN") {
+        return Ok(LoginMode::Pin(pin));
+    }
+    Ok(LoginMode::None)
 }
 
 /// Parse a validity-period string into a `Duration`.
@@ -599,13 +627,17 @@ fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
-    let login = args.auth.login_mode(module);
+    let login = args.auth.login_mode(module)?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
 
     let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
     let priv_handle = session::resolve_single_key(&session, &selector)?;
     let mut signer = Pkcs11Signer::new(session, priv_handle)?;
     signer.set_creation_time(creation_time)?;
+
+    // Pick the hash algorithm to match the signing key strength — same
+    // policy used for cert self-signatures (cert::preferred_hash_for).
+    let hash_algo = cert::preferred_hash_for(signer.public_key());
 
     let data =
         std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
@@ -628,10 +660,10 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
         } else {
             Armorer::new(sink).build()?
         };
-        let mut signing_stream =
-            Signer::with_template(sink, signer, SignatureBuilder::new(SignatureType::Binary))?
-                .detached()
-                .build()?;
+        let template = SignatureBuilder::new(SignatureType::Binary).set_hash_algo(hash_algo);
+        let mut signing_stream = Signer::with_template(sink, signer, template)?
+            .detached()
+            .build()?;
         signing_stream.write_all(&data)?;
         signing_stream.finalize()?;
     }
@@ -653,7 +685,7 @@ fn cmd_cert_export(
 ) -> anyhow::Result<()> {
     // ── Primary tier ─────────────────────────────────────────────────
     let primary_selector = args.key.resolve()?;
-    let primary_login = args.auth.login_mode(module);
+    let primary_login = args.auth.login_mode(module)?;
     let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let primary_validity = if args.no_expiration {
         None
@@ -672,7 +704,7 @@ fn cmd_cert_export(
     let subkey_validity;
 
     if let Some(sel) = &subkey_selector {
-        let subkey_login = build_subkey_login(&args, module);
+        let subkey_login = build_subkey_login(&args, module)?;
         subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
         subkey_validity = if args.subkey_no_expiration {
             None
@@ -753,7 +785,7 @@ fn cmd_cert_revoke(
     args: CertRevokeArgs,
 ) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
-    let login = args.auth.login_mode(module);
+    let login = args.auth.login_mode(module)?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let revocation_time = match args.revocation_time.as_deref() {
         Some(s) => parse_creation_time(Some(s))?,
@@ -789,7 +821,7 @@ fn cmd_subkey_revoke(
     args: SubkeyRevokeArgs,
 ) -> anyhow::Result<()> {
     let primary_selector = args.key.resolve()?;
-    let primary_login = args.auth.login_mode(module);
+    let primary_login = args.auth.login_mode(module)?;
     let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let revocation_time = match args.revocation_time.as_deref() {
         Some(s) => parse_creation_time(Some(s))?,
@@ -798,7 +830,7 @@ fn cmd_subkey_revoke(
 
     let subkey_selector = resolve_subkey_selector(&args)?
         .ok_or_else(|| anyhow::anyhow!("subkey-revoke requires a subkey selector"))?;
-    let subkey_login = build_subkey_login(&args, module);
+    let subkey_login = build_subkey_login(&args, module)?;
     let subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
 
     let (primary_session, _) = session::open_session(pkcs11, &primary_selector, &primary_login)?;

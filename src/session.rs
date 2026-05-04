@@ -38,8 +38,8 @@ impl std::str::FromStr for Pkcs11Uri {
         for part in s.split(';') {
             if let Some((k, v)) = part.split_once('=') {
                 match k {
-                    "token" => uri.token_label = Some(percent_decode(v)),
-                    "object" => uri.object_label = Some(percent_decode(v)),
+                    "token" => uri.token_label = Some(percent_decode(v)?),
+                    "object" => uri.object_label = Some(percent_decode(v)?),
                     // Pass the raw value; parse_id_bytes disambiguates between
                     // RFC 7512 percent-encoding and a hex shortcut by checking
                     // for '%' itself.  Decoding here would erase that signal.
@@ -52,26 +52,20 @@ impl std::str::FromStr for Pkcs11Uri {
     }
 }
 
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hi = chars.next().unwrap_or('0');
-            let lo = chars.next().unwrap_or('0');
-            if let Ok(b) = u8::from_str_radix(&format!("{hi}{lo}"), 16) {
-                out.push(b as char);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+/// Percent-decode a URI text value into a UTF-8 string.
+///
+/// Decodes byte-by-byte (so multi-byte UTF-8 sequences like `%C3%A9` →
+/// `é` round-trip correctly), then validates the result is valid UTF-8.
+/// Malformed escapes (e.g. `%XY` where the digits are non-hex, or a
+/// trailing `%` with fewer than two characters after it) are rejected.
+fn percent_decode(s: &str) -> anyhow::Result<String> {
+    let bytes = percent_decode_bytes(s)?;
+    String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("URI value {s:?} is not valid UTF-8: {e}"))
 }
 
 fn parse_id_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
     if s.contains('%') {
-        Ok(percent_decode_bytes(s))
+        percent_decode_bytes(s)
     } else {
         hex::decode(s).map_err(|e| anyhow::anyhow!("invalid key id hex: {e}"))
     }
@@ -81,24 +75,39 @@ fn parse_id_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
 ///
 /// Required for the `id` URI attribute because CKA_ID is binary; routing it
 /// through `String` would re-encode bytes ≥ 0x80 as multi-byte UTF-8.
-fn percent_decode_bytes(s: &str) -> Vec<u8> {
+/// Malformed escapes are rejected.
+fn percent_decode_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                anyhow::bail!(
+                    "truncated percent-encoded sequence in URI value {s:?} \
+                     (need two hex digits after '%')"
+                );
             }
+            let hi = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid hex digit after '%' in URI value {s:?}: {:?}",
+                    bytes[i + 1] as char
+                )
+            })?;
+            let lo = (bytes[i + 2] as char).to_digit(16).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid hex digit after '%' in URI value {s:?}: {:?}",
+                    bytes[i + 2] as char
+                )
+            })?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    out
+    Ok(out)
 }
 
 /// How to authenticate the session once it is open.
@@ -107,7 +116,9 @@ pub enum LoginMode<'a> {
     /// Module-protected key — no C_Login call needed.
     None,
     /// Softcard or single-card OCS (K=1): standard C_Login with a passphrase.
-    Pin(&'a str),
+    /// The passphrase is owned because it may have been read from a file or
+    /// environment variable that doesn't outlive the args struct.
+    Pin(String),
     /// OCS with K > 1: nShield C_LoginBegin / C_LoginNext / C_LoginEnd.
     OcsQuorum { module_path: &'a Path },
 }
@@ -151,7 +162,7 @@ pub fn open_session(
         LoginMode::None => {}
 
         LoginMode::Pin(pin) => {
-            session.login(UserType::User, Some(&AuthPin::from(pin.to_string())))?;
+            session.login(UserType::User, Some(&AuthPin::from(pin.clone())))?;
         }
 
         LoginMode::OcsQuorum { module_path } => {
@@ -354,6 +365,46 @@ mod tests {
         // String, so 0xAB (a single byte) became 0xC2 0xAB (UTF-8 of U+00AB).
         let uri: Pkcs11Uri = "pkcs11:id=%80%ff%c0".parse().unwrap();
         assert_eq!(uri.key_id.unwrap(), vec![0x80, 0xff, 0xc0]);
+    }
+
+    #[test]
+    fn uri_label_with_utf8_percent_encoding() {
+        // %C3%A9 is the UTF-8 encoding of 'é'.  A correct decoder produces
+        // the 1-character string "é"; the previous byte-as-char decoder
+        // produced "Ã©" (UTF-8 expansion of each byte through char::from).
+        let uri: Pkcs11Uri = "pkcs11:object=caf%C3%A9".parse().unwrap();
+        assert_eq!(uri.object_label.as_deref(), Some("café"));
+    }
+
+    #[test]
+    fn uri_token_label_with_utf8_percent_encoding() {
+        let uri: Pkcs11Uri = "pkcs11:token=%E2%9C%93-token".parse().unwrap();
+        assert_eq!(uri.token_label.as_deref(), Some("✓-token"));
+    }
+
+    #[test]
+    fn uri_rejects_malformed_percent_escape() {
+        let cases = [
+            "pkcs11:object=ba%XY", // non-hex digits
+            "pkcs11:object=ba%",   // truncated (no digits)
+            "pkcs11:object=ba%2",  // truncated (one digit)
+            "pkcs11:id=%XY",       // non-hex digits in id
+        ];
+        for c in cases {
+            let res: std::result::Result<Pkcs11Uri, _> = c.parse();
+            assert!(res.is_err(), "expected {c:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn uri_rejects_invalid_utf8_in_text_field() {
+        // 0xFF is never valid UTF-8 — must be rejected for text fields
+        // (token/object) but is fine for binary id (already covered above).
+        let res: std::result::Result<Pkcs11Uri, _> = "pkcs11:object=%ff".parse();
+        assert!(
+            res.is_err(),
+            "expected invalid UTF-8 in object= to be rejected"
+        );
     }
 
     #[test]

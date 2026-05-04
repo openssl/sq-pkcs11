@@ -57,7 +57,8 @@ Important nShield restrictions on this path:
   session; nShield aborts the sequence on any unrelated PKCS#11 call
   or a card removal in between.
 
-For K = 1 OCS, plain `C_Login` works — use `--pin <passphrase>`.
+For K = 1 OCS, plain `C_Login` works — use `--pin-file <path>` (or the
+`SQ_PKCS11_PIN` env var).
 
 ## Vendor `CKA_NFKM_*` attributes
 

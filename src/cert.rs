@@ -328,7 +328,7 @@ pub fn parse_cert(bytes: &[u8]) -> Result<Cert> {
 ///
 /// For RSA we default to SHA-512 — both well-supported and stronger than
 /// any RSA key size we accept.
-fn preferred_hash_for(public: &Key<PublicParts, UnspecifiedRole>) -> HashAlgorithm {
+pub fn preferred_hash_for(public: &Key<PublicParts, UnspecifiedRole>) -> HashAlgorithm {
     if let mpi::PublicKey::ECDSA { curve, .. } = public.mpis() {
         match curve {
             Curve::NistP256 => HashAlgorithm::SHA256,

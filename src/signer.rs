@@ -177,6 +177,21 @@ fn find_companion_public_key(session: &Session, priv_handle: ObjectHandle) -> Re
     })
 }
 
+/// Compute the bit-length of a big-endian unsigned integer (CKA_MODULUS form).
+///
+/// Skips any leading zero bytes, then computes
+/// `8*remaining_bytes - leading_zero_bits_of_high_byte`.  Returns 0 for an
+/// all-zero input (which the caller should treat as malformed).
+fn rsa_modulus_bit_length(modulus: &[u8]) -> usize {
+    let first_nonzero = match modulus.iter().position(|&b| b != 0) {
+        Some(i) => i,
+        None => return 0,
+    };
+    let remaining = modulus.len() - first_nonzero;
+    let high_bits = 8 - modulus[first_nonzero].leading_zeros() as usize;
+    (remaining - 1) * 8 + high_bits
+}
+
 fn read_rsa_public(
     session: &Session,
     handle: ObjectHandle,
@@ -196,9 +211,16 @@ fn read_rsa_public(
         }
     }
 
-    let n = mpi::MPI::new(
-        &modulus.ok_or_else(|| Error::UnsupportedKeyType("RSA key missing modulus".into()))?,
-    );
+    let modulus_bytes =
+        modulus.ok_or_else(|| Error::UnsupportedKeyType("RSA key missing modulus".into()))?;
+    let bits = rsa_modulus_bit_length(&modulus_bytes);
+    const MIN_RSA_BITS: usize = 2048;
+    if bits < MIN_RSA_BITS {
+        return Err(Error::UnsupportedKeyType(format!(
+            "RSA modulus is {bits} bits; minimum supported is {MIN_RSA_BITS}"
+        )));
+    }
+    let n = mpi::MPI::new(&modulus_bytes);
     let e = mpi::MPI::new(
         &exponent.ok_or_else(|| Error::UnsupportedKeyType("RSA key missing exponent".into()))?,
     );
@@ -492,6 +514,58 @@ mod tests {
         // 0x81 says "1 length byte follows", but no bytes follow.
         let der = &[0x04, 0x81];
         assert!(unwrap_octet_string(der).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // rsa_modulus_bit_length
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rsa_modulus_bit_length_basic() {
+        // 256 bytes, top byte high-bit set → 2048 bits.
+        let mut m2048 = vec![0xff; 256];
+        m2048[0] = 0x80;
+        assert_eq!(rsa_modulus_bit_length(&m2048), 2048);
+
+        // 256 bytes, top byte high-bit clear → 2047 bits.
+        let mut m2047 = vec![0xff; 256];
+        m2047[0] = 0x7f;
+        assert_eq!(rsa_modulus_bit_length(&m2047), 2047);
+
+        // 384 bytes, top byte 0xc0 → 3072 - 0 = 3071? Actually high_bits = 8 - 0 = 8 (0xc0
+        // has leading 0 zero bits since 0xc0 = 0b11000000, leading_zeros = 0).
+        let mut m3072 = vec![0u8; 384];
+        m3072[0] = 0xc0;
+        assert_eq!(rsa_modulus_bit_length(&m3072), 384 * 8);
+        assert_eq!(rsa_modulus_bit_length(&m3072), 3072);
+
+        // 512 bytes, top byte high-bit set → 4096 bits.
+        let mut m4096 = vec![0u8; 512];
+        m4096[0] = 0x80;
+        assert_eq!(rsa_modulus_bit_length(&m4096), 4096);
+    }
+
+    #[test]
+    fn rsa_modulus_bit_length_skips_leading_zeros() {
+        // Three leading zero bytes, then one 0x80 byte: bit length = 8 (only the high bit).
+        let m = [0x00, 0x00, 0x00, 0x80];
+        assert_eq!(rsa_modulus_bit_length(&m), 8);
+    }
+
+    #[test]
+    fn rsa_modulus_bit_length_all_zero() {
+        // Pathological input — caller treats as malformed.
+        assert_eq!(rsa_modulus_bit_length(&[0x00, 0x00, 0x00]), 0);
+        assert_eq!(rsa_modulus_bit_length(&[]), 0);
+    }
+
+    #[test]
+    fn rsa_modulus_bit_length_below_2048_rejected() {
+        // 1024-bit modulus.  This drives the MIN_RSA_BITS check in read_rsa_public.
+        let mut m1024 = vec![0u8; 128];
+        m1024[0] = 0x80;
+        assert_eq!(rsa_modulus_bit_length(&m1024), 1024);
+        assert!(rsa_modulus_bit_length(&m1024) < 2048);
     }
 
     // -------------------------------------------------------------------
