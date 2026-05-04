@@ -97,9 +97,10 @@ impl KeySelectionArgs {
 
 #[derive(clap::Args)]
 struct AuthArgs {
-    /// Read the softcard / K=1 OCS passphrase from this file (single line,
-    /// trailing whitespace trimmed).  Omit entirely for module-protected
-    /// keys.
+    /// Read the softcard / K=1 OCS passphrase from this file.  A single
+    /// trailing newline (CR, LF, or CRLF) is removed; no other characters
+    /// are trimmed, so leading or interior whitespace in the passphrase is
+    /// preserved.  Omit entirely for module-protected keys.
     ///
     /// As an alternative, the `SQ_PKCS11_PIN` environment variable is read
     /// when this flag is absent.  There is no `--pin <PASS>` value flag
@@ -449,9 +450,12 @@ struct ListKeysArgs {
     #[arg(long)]
     all_slots: bool,
 
-    /// PIN to attempt login with (softcard / single-card OCS).
-    #[arg(long, env = "SQ_PKCS11_PIN")]
-    pin: Option<String>,
+    /// File containing a PIN to attempt login with (softcard /
+    /// single-card OCS).  Same format and rationale as the sign /
+    /// cert-export `--pin-file`.  `SQ_PKCS11_PIN` env var is read when
+    /// this flag is absent.
+    #[arg(long, value_name = "FILE")]
+    pin_file: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +904,12 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
     use cryptoki::session::UserType;
     use cryptoki::types::AuthPin;
 
+    // Resolve the optional PIN once: --pin-file beats env var.
+    let pin: Option<String> = match &args.pin_file {
+        Some(path) => Some(read_pin_file(path)?),
+        None => std::env::var("SQ_PKCS11_PIN").ok(),
+    };
+
     let slots = if args.all_slots {
         pkcs11.get_all_slots()?
     } else {
@@ -938,8 +948,8 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
             }
         };
 
-        if let Some(pin) = &args.pin {
-            let _ = session.login(UserType::User, Some(&AuthPin::from(pin.as_str())));
+        if let Some(p) = &pin {
+            let _ = session.login(UserType::User, Some(&AuthPin::from(p.clone())));
         }
 
         let handles = session.find_objects(&[
