@@ -192,11 +192,39 @@ on top:
   --output          release-v2.asc
 ```
 
-Why preserve old subkeys?  Signatures made by them remain verifiable
-forever as long as the cert advertises the subkey, so retiring an old
-subkey by *deleting* it from the cert would invalidate every release
-signature ever made with it.  The right pattern is to **expire** an old
-subkey (its `--subkey-validity-period` lapses, so it can't make new
+#### Which timestamps are fixed and which are free
+
+The two creation-time flags behave very differently in merge mode:
+
+| Flag | Refers to | In merge mode |
+|---|---|---|
+| `--creation-time` | the **primary** key | **Must** match the value used when the cert was first published. The primary fingerprint is the cert's identity; if your timestamp produces a different fingerprint, the tool refuses to merge with a hard error. |
+| `--subkey-creation-time` | the **new** subkey being added | Free choice — typically the date you're cutting over to the new subkey. |
+
+You do **not** supply (or need to remember) the *old* subkey's
+creation time.  The old subkey, its binding signature, and its embedded
+creation time are already in the input cert and are preserved as-is.
+
+After rotation, when signing with the new subkey, pass *its* creation
+time (not the primary's) on `sign`:
+
+```sh
+./sq-pkcs11 sign \
+  --key-label      openssl-release-sign-2027 \
+  --creation-time  2027-05-01T00:00:00Z \    # the NEW subkey's creation time
+  release.tar.gz
+```
+
+Old signatures made with the old subkey keep verifying because the old
+subkey is still in the merged cert.
+
+#### Why preserve old subkeys
+
+Signatures made by an old subkey remain verifiable forever as long as
+the cert advertises that subkey, so retiring an old subkey by
+*deleting* it from the cert would invalidate every release signature
+ever made with it.  The right pattern is to **expire** an old subkey
+(its `--subkey-validity-period` lapses, so it can't make new
 signatures) but **leave it in the published certificate** so historical
 signatures keep verifying.  When the key is genuinely compromised, also
 issue a subkey revocation (below).
