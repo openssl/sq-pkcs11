@@ -2,6 +2,13 @@
 name = "sq-pkcs11"
 version = "0.1.0"
 edition = "2021"
+# Floor is set by the largest transitive in our dependency graph: as of
+# sequoia-openpgp 2.2, the idna_adapter 1.2.x → icu_* 2.2 chain requires
+# rustc 1.86.  Cargo's MSRV-aware resolver will refuse to pick newer
+# transitive versions that bump this further so long as rust-version is
+# declared.  Update both this field and the README in lockstep when the
+# floor moves.
+rust-version = "1.86"
 description = "Sign OpenPGP release artifacts using keys stored on a PKCS#11 HSM"
 license = "Apache-2.0"
 

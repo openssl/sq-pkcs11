@@ -30,7 +30,11 @@ key-generation timestamp, and FIPS 140-3 algorithm constraints — see
 
 ## Requirements
 
-- Rust 1.75 or newer
+- Rust 1.86 or newer (set by `rust-version` in `Cargo.toml`; the floor
+  is driven by transitive deps from `sequoia-openpgp` and moves with
+  upstream releases). On Debian/Ubuntu, the distro-packaged `rustc` is
+  often older than this — install a current toolchain via
+  [rustup](https://rustup.rs/) instead.
 - A C toolchain and OpenSSL development headers (`libssl-dev` /
   `openssl-devel`) for building Sequoia's OpenSSL crypto backend
 - A PKCS#11 v2.40+ module from your HSM vendor at runtime
