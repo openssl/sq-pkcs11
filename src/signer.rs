@@ -371,7 +371,30 @@ fn encode_signature(
             s: mpi::MPI::new(raw),
         }),
         PublicKeyAlgorithm::ECDSA => {
-            // CKM_ECDSA returns a fixed-size r||s blob (each half = curve order size).
+            // CKM_ECDSA returns a fixed-size r||s blob, each half = curve
+            // order size (P-256 ⇒ 32, P-384 ⇒ 48, P-521 ⇒ 66).  Validate
+            // the length against the curve before splitting — a buggy or
+            // hostile token returning an unexpected length would otherwise
+            // produce a malformed OpenPGP signature that fails verification
+            // far away from the cause.
+            let curve = match public.mpis() {
+                mpi::PublicKey::ECDSA { curve, .. } => curve,
+                _ => {
+                    return Err(sequoia_openpgp::Error::InvalidArgument(
+                        "ECDSA pk_algo but non-ECDSA public-key material".into(),
+                    )
+                    .into());
+                }
+            };
+            let expected = expected_ecdsa_signature_len(curve)?;
+            if raw.len() != expected {
+                return Err(sequoia_openpgp::Error::InvalidArgument(format!(
+                    "ECDSA signature on curve {curve:?}: token returned {} bytes, \
+                     expected {expected}",
+                    raw.len(),
+                ))
+                .into());
+            }
             let half = raw.len() / 2;
             Ok(mpi::Signature::ECDSA {
                 r: mpi::MPI::new(&raw[..half]),
@@ -380,6 +403,20 @@ fn encode_signature(
         }
         other => Err(sequoia_openpgp::Error::InvalidArgument(format!(
             "unsupported algorithm for signature encoding: {other:?}"
+        ))
+        .into()),
+    }
+}
+
+/// Total length of a raw r||s ECDSA signature for a NIST curve.  Used to
+/// validate the bytes returned by `CKM_ECDSA` before we split and encode.
+fn expected_ecdsa_signature_len(curve: &Curve) -> sequoia_openpgp::Result<usize> {
+    match curve {
+        Curve::NistP256 => Ok(64),
+        Curve::NistP384 => Ok(96),
+        Curve::NistP521 => Ok(132),
+        other => Err(sequoia_openpgp::Error::InvalidArgument(format!(
+            "unsupported ECDSA curve for signature encoding: {other:?}"
         ))
         .into()),
     }
@@ -693,5 +730,44 @@ mod tests {
             }
             _ => panic!("expected ECDSA signature"),
         }
+    }
+
+    #[test]
+    fn encode_signature_ecdsa_rejects_too_short() {
+        // Half the right length — would split silently before the fix.
+        let raw = vec![0x11u8; 48];
+        let key = ecdsa_p384_test_key();
+        let err = encode_signature(&key, &raw).unwrap_err().to_string();
+        assert!(
+            err.contains("expected 96") && err.contains("48 bytes"),
+            "expected curve-mismatch error mentioning both sizes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encode_signature_ecdsa_rejects_too_long() {
+        let raw = vec![0x11u8; 100];
+        let key = ecdsa_p384_test_key();
+        let err = encode_signature(&key, &raw).unwrap_err().to_string();
+        assert!(err.contains("expected 96"), "got: {err}");
+    }
+
+    #[test]
+    fn encode_signature_ecdsa_rejects_odd_length() {
+        // 95 bytes — odd, so naive "split in half" would silently produce
+        // an unbalanced (r, s) pair.  Must be rejected up front.
+        let raw = vec![0x11u8; 95];
+        let key = ecdsa_p384_test_key();
+        assert!(encode_signature(&key, &raw).is_err());
+    }
+
+    #[test]
+    fn expected_ecdsa_signature_len_per_curve() {
+        assert_eq!(expected_ecdsa_signature_len(&Curve::NistP256).unwrap(), 64);
+        assert_eq!(expected_ecdsa_signature_len(&Curve::NistP384).unwrap(), 96);
+        assert_eq!(expected_ecdsa_signature_len(&Curve::NistP521).unwrap(), 132);
+        // Curves we don't support (e.g. P-192) must not silently get a
+        // default size; the function returns Err.
+        assert!(expected_ecdsa_signature_len(&Curve::Cv25519).is_err());
     }
 }
