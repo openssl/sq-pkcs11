@@ -325,6 +325,37 @@ gpg --import release-revocation.asc
 gpg -k     # primary now shown as [revoked]
 ```
 
+### Caveat: GnuPG ignores standalone subkey-revocation files
+
+The two-step `gpg --import cert.asc; gpg --import revocation.asc` flow
+shown above works as expected for **primary-key** revocations, but
+GnuPG (tested through 2.4.x) **silently drops a standalone subkey
+revocation imported on its own**.  Its `--import` reports
+`Total number processed: 0` and the subkey is never marked revoked
+in the keyring.  This is a long-standing GnuPG behaviour — the packet
+emitted by `subkey-revoke` is structurally correct (Sequoia's `sq`
+applies it without complaint), GnuPG just doesn't pair an orphan
+SubkeyRevocation packet with an existing subkey in its database.
+
+When publishing a subkey revocation for GnuPG-using consumers,
+distribute it **bundled with the cert** as a single file:
+
+```sh
+# Producer side (after subkey-revoke produced sign-2026-revocation.asc):
+cat release.asc sign-2026-revocation.asc > release-with-subkey-revoked.asc
+
+# Consumer side:
+gpg --import release-with-subkey-revoked.asc
+gpg -k   # subkey now shown as [revoked]
+```
+
+Keyservers that serve the merged cert (e.g. keys.openpgp.org after the
+revocation has been uploaded as part of the cert) sidestep this for
+fetch-based consumers; the caveat applies primarily to operators
+publishing revocation-only files on a website for manual import.
+
+### Keep old subkeys around
+
 For day-to-day operations, **keep old expired and superseded subkeys
 in the published certificate**.  Removing a subkey from the cert
 invalidates every signature ever made with it; expiring or revoking it
