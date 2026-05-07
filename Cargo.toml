@@ -26,8 +26,12 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "2"
 
-# Secure passphrase prompting
-rpassword = "7"
+# Secure passphrase prompting.  Pinned to 7.4.x because rpassword 7.5
+# adopts let-chain syntax (stabilised in Rust 1.88) without declaring
+# its own rust-version, which silently breaks builds on our declared
+# MSRV (1.86).  Loosen to "7" once rpassword either declares its MSRV
+# or we bump ours.
+rpassword = "~7.4"
 
 # Hex encoding for CKA_ID display/parsing
 hex = "0.4"
