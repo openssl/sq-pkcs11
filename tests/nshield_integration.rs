@@ -330,6 +330,204 @@ fn ec_sign_verify_with_gpg() {
 }
 
 // ---------------------------------------------------------------------------
+// sq (Sequoia CLI) parity tests.
+//
+// The gpg-based tests above prove our outputs are accepted by GnuPG.
+// The tests below assert the same artefacts verify cleanly through
+// Sequoia's own `sq` CLI — different OpenPGP implementation, different
+// crypto backend, useful as a sanity check that we don't accidentally
+// produce GnuPG-leniency-shaped artefacts.
+// ---------------------------------------------------------------------------
+
+/// `sq` invocation pointed at an isolated home directory so tests don't
+/// touch the operator's real Sequoia keystore.
+fn sq_cli(home: &Path) -> StdCommand {
+    let mut c = StdCommand::new("sq");
+    c.arg("--home").arg(home).arg("--batch");
+    c
+}
+
+/// Set up a fresh sq home directory inside `tmp` and return its path.
+fn fresh_sq_home(tmp: &TempDir) -> PathBuf {
+    let home = tmp.path().join("sq");
+    std::fs::create_dir_all(&home).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    home
+}
+
+fn sq_sign_verify_roundtrip(env: &TestEnv, key_label: &str, userid: &str) {
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let payload = tmp.path().join("payload.txt");
+    let signature = tmp.path().join("payload.txt.asc");
+    let sq_home = fresh_sq_home(&tmp);
+
+    std::fs::write(&payload, b"test payload bytes\n").unwrap();
+
+    // 1. Export the cert via sq-pkcs11.
+    sq_pkcs11(env)
+        .args(["cert-export"])
+        .args(["--key-label", key_label])
+        .args(["--userid", userid])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    // 2. Produce a detached signature via sq-pkcs11.
+    sq_pkcs11(env)
+        .args(["sign"])
+        .args(["--key-label", key_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload)
+        .assert()
+        .success();
+    assert!(signature.exists(), "sign did not create {signature:?}");
+
+    // 3. Verify with sq.  --signer-file gives sq the cert directly so
+    //    we don't have to import into a keystore first; --signature-file
+    //    points at the detached signature.  sq exits 0 on success.
+    let verify = sq_cli(&sq_home)
+        .arg("verify")
+        .arg("--signer-file")
+        .arg(&cert_path)
+        .arg("--signature-file")
+        .arg(&signature)
+        .arg(&payload)
+        .output()
+        .expect("sq verify");
+    assert!(
+        verify.status.success(),
+        "sq verify failed for {key_label}:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+    );
+}
+
+#[test]
+fn rsa_sign_verify_with_sq() {
+    let env = require_env!();
+    sq_sign_verify_roundtrip(&env, &env.rsa_label, "SQ Test RSA <sq-rsa@example.com>");
+}
+
+#[test]
+fn ec_sign_verify_with_sq() {
+    let env = require_env!();
+    sq_sign_verify_roundtrip(&env, &env.ec_label, "SQ Test EC <sq-ec@example.com>");
+}
+
+#[test]
+fn sq_honours_standalone_subkey_revocation() {
+    // Sequoia's sq (unlike GnuPG — see README's caveat under
+    // "Caveat: GnuPG ignores standalone subkey-revocation files")
+    // *does* apply a SubkeyRevocation packet imported on its own.
+    // This test confirms our subkey-revoke output is structurally
+    // correct and would Just Work with any Sequoia-based verifier.
+    //
+    // Flow: build a two-tier cert, sign a payload with the subkey,
+    // verify (must succeed), then issue a "compromised" subkey
+    // revocation, merge cert+revocation into one file, and verify
+    // again (must fail because the signing subkey is now revoked
+    // and "compromised" invalidates past signatures).
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let merged_cert = tmp.path().join("cert-with-revocation.asc");
+    let payload = tmp.path().join("payload.txt");
+    let signature = tmp.path().join("payload.txt.asc");
+    let revocation = tmp.path().join("subkey-revocation.asc");
+    let sq_home = fresh_sq_home(&tmp);
+
+    std::fs::write(&payload, b"sq subkey-revocation parity\n").unwrap();
+
+    // 1. Two-tier cert.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "SQ Subkey Revoke <sq-skrev@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    // 2. Sign with the subkey.
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload)
+        .assert()
+        .success();
+
+    // 3. Verify against the un-revoked cert — must succeed.
+    let verify_before = sq_cli(&sq_home)
+        .arg("verify")
+        .arg("--signer-file")
+        .arg(&cert_path)
+        .arg("--signature-file")
+        .arg(&signature)
+        .arg(&payload)
+        .output()
+        .expect("sq verify (before revocation)");
+    assert!(
+        verify_before.status.success(),
+        "sq verify against the un-revoked cert must succeed:\nstderr: {}",
+        String::from_utf8_lossy(&verify_before.stderr),
+    );
+
+    // 4. Issue a "compromised" subkey revocation.
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--message", "sq subkey revocation parity test"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .success();
+
+    // 5. Merge cert + standalone revocation into one file.  Sequoia's
+    //    Cert parser handles the concatenation natively (a TPK followed
+    //    by a SubkeyRevocation Signature merges into a cert with the
+    //    subkey marked revoked).
+    let cert_bytes = std::fs::read(&cert_path).unwrap();
+    let rev_bytes = std::fs::read(&revocation).unwrap();
+    std::fs::write(&merged_cert, [&cert_bytes[..], &rev_bytes[..]].concat()).unwrap();
+
+    // 6. Verify against the merged cert — must FAIL because the signing
+    //    subkey is now revoked with reason "compromised", which
+    //    invalidates past signatures.
+    let verify_after = sq_cli(&sq_home)
+        .arg("verify")
+        .arg("--signer-file")
+        .arg(&merged_cert)
+        .arg("--signature-file")
+        .arg(&signature)
+        .arg(&payload)
+        .output()
+        .expect("sq verify (after revocation)");
+    assert!(
+        !verify_after.status.success(),
+        "sq verify against the cert-with-subkey-revocation must FAIL when \
+         the subkey was revoked as compromised:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify_after.stdout),
+        String::from_utf8_lossy(&verify_after.stderr),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Output format
 // ---------------------------------------------------------------------------
 
