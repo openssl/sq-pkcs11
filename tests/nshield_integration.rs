@@ -1047,6 +1047,138 @@ fn subkey_revoke_rejects_input_cert_belonging_to_other_primary() {
 }
 
 #[test]
+fn sign_rejects_nonexistent_input_file() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("does-not-exist.txt");
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&missing)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("does-not-exist") || stderr.contains("No such file"),
+        "expected error mentioning the missing path, got: {stderr}"
+    );
+}
+
+#[test]
+fn sign_rejects_directory_as_input() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    // tmp.path() itself is a directory.
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(tmp.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        // std::fs::read on a directory returns a platform-dependent
+        // error (EISDIR on Linux); accept any non-empty diagnostic.
+        !stderr.is_empty(),
+        "expected a non-empty error when input is a directory"
+    );
+}
+
+#[test]
+fn sign_default_output_refuses_overwrite_without_force() {
+    // sign without --output derives <input>.asc as the output path.
+    // That derived path must also be subject to the preflight refuse-
+    // to-overwrite check, otherwise an accidental rerun against a
+    // payload whose `.asc` already exists would clobber it.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let payload = tmp.path().join("p.txt");
+    let derived = tmp.path().join("p.txt.asc");
+    std::fs::write(&payload, b"payload\n").unwrap();
+    std::fs::write(&derived, b"PRECIOUS\n").unwrap();
+
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .arg(&payload)
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr).contains("refusing to overwrite"),
+        "expected refuse-to-overwrite for the auto-derived output path"
+    );
+    assert_eq!(std::fs::read(&derived).unwrap(), b"PRECIOUS\n");
+}
+
+#[test]
+fn cert_revoke_revocation_time_round_trips_exactly() {
+    // The --revocation-time supplied on the command line must end up
+    // verbatim in the produced Signature's signature-creation-time
+    // subpacket, even when the time is in the future or before the
+    // key's creation time (the operator may legitimately want either
+    // for a back-dated or scheduled revocation).
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+
+    for case in [
+        ("future", "2030-12-31T23:59:59Z"),
+        ("past_pre_key_creation", "2020-01-01T00:00:00Z"),
+        ("epoch", "1970-01-01T00:00:00Z"),
+    ] {
+        let (label, ts) = case;
+        let revocation = tmp.path().join(format!("rev-{label}.asc"));
+        sq_pkcs11(&env)
+            .args(["cert-revoke"])
+            .args(["--key-label", &env.ec_label])
+            .args(["--creation-time", STABLE_TIME])
+            .args(["--revocation-time", ts])
+            .args(["--reason", "superseded"])
+            .args(["--message", label])
+            .args(["--output"])
+            .arg(&revocation)
+            .assert()
+            .success();
+
+        let sig = parse_signature_file(&revocation);
+        let actual = sig
+            .signature_creation_time()
+            .expect("signature creation time present");
+        let expected = humantime::parse_rfc3339(ts).unwrap();
+        assert_eq!(
+            actual, expected,
+            "revocation_time {ts:?} must round-trip exactly into the signature \
+             creation time subpacket (case: {label})"
+        );
+    }
+}
+
+#[test]
+fn cert_revoke_rejects_invalid_revocation_time() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let revocation = tmp.path().join("rev.asc");
+    let assert = sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--revocation-time", "not-a-real-timestamp"])
+        .args(["--reason", "superseded"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("invalid") || stderr.contains("RFC 3339"),
+        "expected RFC 3339 parse error, got: {stderr}"
+    );
+    assert!(!revocation.exists());
+}
+
+#[test]
 fn sign_preflights_overwrite_before_hsm_round_trip() {
     // The preflight check must fail BEFORE we open an HSM session.  We
     // arrange a configuration that would otherwise fail with
