@@ -978,6 +978,299 @@ fn cert_revoke_marks_primary_revoked() {
 }
 
 #[test]
+fn subkey_revoke_rejects_input_cert_belonging_to_other_primary() {
+    // If the operator picks the wrong --key-label (or right label with
+    // wrong --creation-time) but supplies an --input-cert whose
+    // primary fingerprint doesn't match what the HSM would derive,
+    // sq-pkcs11 must refuse before signing.  Without this guard the
+    // tool would produce a "revocation" signed by primary A naming a
+    // subkey of cert B — a useless artefact that wastes an HSM
+    // operation.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_a = tmp.path().join("cert-a.asc");
+    let cert_b = tmp.path().join("cert-b.asc");
+    let revocation = tmp.path().join("revocation.asc");
+
+    // Cert A: primary = ec_label.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Cert A <a@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_a)
+        .assert()
+        .success();
+
+    // Cert B: primary = primary_label (different HSM key, different
+    // fingerprint).
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Cert B <b@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_b)
+        .assert()
+        .success();
+
+    // Mix them: primary selector points at cert A's primary key, but
+    // --input-cert is cert B and --subkey-fingerprint is from cert B.
+    let cert_b_subkey_fpr = subkey_fingerprint_hex(&cert_b);
+    let assert = sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.ec_label]) // ← primary of cert A
+        .args(["--input-cert"])
+        .arg(&cert_b) // ← cert with a different primary
+        .args(["--subkey-fingerprint", &cert_b_subkey_fpr])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--message", "wrong primary test"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("primary fingerprint mismatch"),
+        "expected 'primary fingerprint mismatch' in stderr, got: {stderr}"
+    );
+    assert!(
+        !revocation.exists(),
+        "subkey-revoke must not write output when primary doesn't match the input cert"
+    );
+}
+
+#[test]
+fn sign_preflights_overwrite_before_hsm_round_trip() {
+    // The preflight check must fail BEFORE we open an HSM session.  We
+    // arrange a configuration that would otherwise fail with
+    // "key not found" deep inside the HSM lookup, and confirm that with
+    // an existing output file we instead see "refusing to overwrite" —
+    // proof that we never reached the key-resolution step.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let payload = tmp.path().join("p.txt");
+    let signature = tmp.path().join("p.txt.asc");
+    std::fs::write(&payload, b"preflight test\n").unwrap();
+    std::fs::write(&signature, b"DO NOT TOUCH\n").unwrap();
+
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        // A label that demonstrably doesn't exist on the HSM — without
+        // preflight, this would surface "is not present in the Security
+        // World" or similar.  With preflight, we never reach the lookup.
+        .args(["--key-label", "this-key-does-not-exist-xyz"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&signature)
+        .arg(&payload)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("refusing to overwrite"),
+        "expected preflight 'refusing to overwrite' BEFORE HSM key lookup; got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&signature).unwrap(),
+        b"DO NOT TOUCH\n",
+        "existing output bytes must be untouched"
+    );
+}
+
+#[test]
+fn cert_revoke_refuses_overwrite_without_force() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let revocation = tmp.path().join("rev.asc");
+    std::fs::write(&revocation, b"PRECIOUS\n").unwrap();
+    let assert = sq_pkcs11(&env)
+        .args(["cert-revoke"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "superseded"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr).contains("refusing to overwrite"),
+        "expected 'refusing to overwrite' in stderr"
+    );
+    assert_eq!(std::fs::read(&revocation).unwrap(), b"PRECIOUS\n");
+}
+
+#[test]
+fn subkey_revoke_refuses_overwrite_without_force_and_force_overwrites() {
+    use sequoia_openpgp::types::SignatureType;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let revocation = tmp.path().join("rev.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Force Test <ft@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+    let subkey_fpr = subkey_fingerprint_hex(&cert);
+
+    // Pre-create the output.  First run (no --force) must refuse and
+    // leave the bytes alone.
+    std::fs::write(&revocation, b"PRECIOUS\n").unwrap();
+    let assert = sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", &subkey_fpr])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr).contains("refusing to overwrite"),
+        "expected refuse-to-overwrite"
+    );
+    assert_eq!(std::fs::read(&revocation).unwrap(), b"PRECIOUS\n");
+
+    // Second run with --force: must overwrite and produce a valid
+    // SubkeyRevocation packet.
+    sq_pkcs11(&env)
+        .args(["subkey-revoke", "--force"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", &subkey_fpr])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .success();
+    assert_ne!(std::fs::read(&revocation).unwrap(), b"PRECIOUS\n");
+    let sig = parse_signature_file(&revocation);
+    assert_eq!(sig.typ(), SignatureType::SubkeyRevocation);
+}
+
+#[test]
+fn subkey_revoke_rejects_malformed_inputs() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let bad_cert = tmp.path().join("bad-cert.asc");
+    let revocation = tmp.path().join("rev.asc");
+
+    // Real cert for the cases that need a parseable cert.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Malformed Test <mt@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+    let primary_fpr = parse_cert_file(&cert).fingerprint().to_string();
+
+    // 1. Garbage cert input — must fail in the parser, before HSM access.
+    std::fs::write(&bad_cert, b"this is not an OpenPGP cert\n").unwrap();
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&bad_cert)
+        .args([
+            "--subkey-fingerprint",
+            "0000000000000000000000000000000000000000",
+        ])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    assert!(!revocation.exists());
+
+    // 2. Short (16-hex) key ID is rejected up front: not collision-resistant.
+    let assert = sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", "0123456789ABCDEF"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("not a full OpenPGP fingerprint"),
+        "expected 'not a full OpenPGP fingerprint' for 16-hex input, got: {stderr}"
+    );
+    assert!(!revocation.exists());
+
+    // 3. Non-hex characters in fingerprint.
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args([
+            "--subkey-fingerprint",
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        ])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    assert!(!revocation.exists());
+
+    // 4. Primary fingerprint where a subkey fingerprint is expected:
+    //    the primary is in the cert but is not a subkey, so the search
+    //    must fail with "no subkey ... matches".
+    let assert = sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", &primary_fpr])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr)
+            .contains("no subkey in the input cert matches"),
+        "expected 'no subkey ... matches' for primary-fingerprint input"
+    );
+    assert!(!revocation.exists());
+}
+
+#[test]
 fn subkey_revoke_works_without_subkey_hsm_access() {
     // The whole point of the subkey-revoke API redesign: a compromised
     // or lost signing subkey must still be revokable using only the

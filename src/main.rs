@@ -423,10 +423,14 @@ struct SubkeyRevokeArgs {
     #[arg(long, value_name = "FILE")]
     input_cert: PathBuf,
 
-    /// Fingerprint (40 hex chars) or key ID (16 hex chars) identifying
-    /// which subkey within --input-cert to revoke.  Whitespace and `0x`
-    /// prefix are ignored.
-    #[arg(long, value_name = "FPR_OR_KEYID")]
+    /// Full 40-hex-char OpenPGP fingerprint of the subkey within
+    /// --input-cert to revoke.  Whitespace and an optional `0x` prefix
+    /// are ignored.  Short 16-hex key IDs are NOT accepted because they
+    /// are not collision-resistant — for revocation the unambiguous
+    /// fingerprint is required.  Look it up with
+    /// `sq inspect <input-cert>` or
+    /// `gpg --list-keys --with-subkey-fingerprint`.
+    #[arg(long, value_name = "FINGERPRINT")]
     subkey_fingerprint: String,
 
     /// Revocation reason code.
@@ -602,6 +606,43 @@ fn parse_creation_time(s: Option<&str>) -> anyhow::Result<std::time::SystemTime>
     }
 }
 
+/// Refuse to clobber an existing output file *before* any HSM round
+/// trip.  Used by every command that writes file output: an accidental
+/// rerun of e.g. `sign` against the same `--output` previously failed
+/// only after we'd already asked the HSM to sign — wasted work, and an
+/// extraneous key-usage audit-log entry for an attempt that never
+/// produced an artefact.  Calling this preflight at the top of each
+/// command catches the common case before opening any session.
+///
+/// `write_or_refuse` still does its own atomic create_new check at write
+/// time to close the TOCTOU window.  This helper is the fast path.
+fn preflight_overwrite(output: Option<&std::path::Path>, force: bool) -> anyhow::Result<()> {
+    if force {
+        return Ok(());
+    }
+    let path = match output {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    // `--output -` means stdout; never a file.
+    if path == std::path::Path::new("-") {
+        return Ok(());
+    }
+    // try_exists() distinguishes "exists" from "permission-denied while
+    // checking"; the latter we surface as an error rather than a refusal.
+    match path.try_exists() {
+        Ok(true) => anyhow::bail!(
+            "refusing to overwrite existing file {}; pass --force to overwrite",
+            path.display()
+        ),
+        Ok(false) => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "checking whether {} already exists",
+            path.display()
+        ))),
+    }
+}
+
 /// Write `bytes` to `path`, refusing to overwrite an existing file unless
 /// `force` is set.  Used by every command that writes a non-stdout output —
 /// signatures, certs, revocation files — so a stale `release.asc` cannot be
@@ -660,21 +701,11 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
     let login = args.auth.login_mode(module)?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
 
-    let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
-    let priv_handle = session::resolve_single_key(&session, &selector)?;
-    let mut signer = Pkcs11Signer::new(session, priv_handle)?;
-    signer.set_creation_time(creation_time)?;
-
-    // Pick the hash algorithm to match the signing key strength — same
-    // policy used for cert self-signatures (cert::preferred_hash_for).
-    let hash_algo = cert::preferred_hash_for(signer.public_key());
-
-    let data =
-        std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
-
-    // Decide where the signature goes before we actually sign, so we can
-    // catch a "refuse to overwrite" condition for file output without
-    // having spent an HSM round-trip.
+    // Resolve the output path first, then preflight the overwrite check
+    // BEFORE opening the HSM session.  Without this, an accidental
+    // rerun against the same `--output` would consume an HSM signing
+    // operation (and the corresponding key-usage audit-log entry)
+    // before failing on the existing file.
     let output_target = match args.output.as_deref() {
         Some(p) if p == std::path::Path::new("-") => SignOutput::Stdout,
         Some(p) => SignOutput::File(p.to_path_buf()),
@@ -688,6 +719,21 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
             SignOutput::File(p)
         }
     };
+    if let SignOutput::File(path) = &output_target {
+        preflight_overwrite(Some(path), args.force)?;
+    }
+
+    let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
+    let priv_handle = session::resolve_single_key(&session, &selector)?;
+    let mut signer = Pkcs11Signer::new(session, priv_handle)?;
+    signer.set_creation_time(creation_time)?;
+
+    // Pick the hash algorithm to match the signing key strength — same
+    // policy used for cert self-signatures (cert::preferred_hash_for).
+    let hash_algo = cert::preferred_hash_for(signer.public_key());
+
+    let data =
+        std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
 
     let mut sig_buf = Vec::new();
     {
@@ -738,6 +784,12 @@ fn cmd_cert_export(
     module: &std::path::Path,
     args: CertExportArgs,
 ) -> anyhow::Result<()> {
+    // Preflight overwrite before any HSM round trip.  cert-export
+    // produces multiple signatures (direct-key, every UID binding, and
+    // the subkey binding + cross-sig if a subkey is requested) — wasting
+    // all of those against an existing file is especially expensive.
+    preflight_overwrite(args.output.as_deref(), args.force)?;
+
     // ── Primary tier ─────────────────────────────────────────────────
     let primary_selector = args.key.resolve()?;
     let primary_login = args.auth.login_mode(module)?;
@@ -837,6 +889,9 @@ fn cmd_cert_revoke(
     module: &std::path::Path,
     args: CertRevokeArgs,
 ) -> anyhow::Result<()> {
+    // Preflight overwrite before opening any HSM session.
+    preflight_overwrite(args.output.as_deref(), args.force)?;
+
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode(module)?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
@@ -881,15 +936,47 @@ fn cmd_subkey_revoke(
         None => std::time::SystemTime::now(),
     };
 
-    // Read the published cert and find the subkey to revoke by
-    // fingerprint or key ID.  No HSM access for the subkey itself —
-    // this is what makes the compromise-response path work even when
-    // the signing-subkey's secret has been deleted, lost, or stolen.
-    let subkey_public = locate_subkey_in_cert(&args.input_cert, &args.subkey_fingerprint)?;
+    // Preflight: refuse to overwrite output BEFORE any HSM round trip
+    // so an accidental rerun does not consume an HSM signing operation
+    // (and the corresponding key-usage audit-log entry).
+    preflight_overwrite(args.output.as_deref(), args.force)?;
+
+    // Parse the cert, parse the fingerprint, locate the subkey.  No HSM
+    // access yet — these are all local checks.
+    let target_fpr = parse_full_fingerprint(&args.subkey_fingerprint)?;
+    let cert_bytes = std::fs::read(&args.input_cert)
+        .with_context(|| format!("reading --input-cert {}", args.input_cert.display()))?;
+    let cert = cert::parse_cert(&cert_bytes)?;
+    let subkey_public = locate_subkey_in_cert(&cert, &target_fpr)?;
 
     let (primary_session, _) = session::open_session(pkcs11, &primary_selector, &primary_login)?;
     let primary_handle = session::resolve_single_key(&primary_session, &primary_selector)?;
     let mut primary_signer = Pkcs11Signer::new(primary_session, primary_handle)?;
+    primary_signer.set_creation_time(primary_creation_time)?;
+
+    // Verify the HSM-derived primary fingerprint matches the cert's
+    // primary fingerprint.  Without this check, an operator who picks
+    // the wrong --key-label (or the right label with the wrong
+    // --creation-time) could produce a revocation signed by primary A
+    // for a subkey of cert B — a footgun that wastes an HSM signing
+    // operation and may not even fail loudly downstream.
+    let hsm_primary = sequoia_openpgp::packet::Key::V4(sequoia_openpgp::packet::key::Key4::<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::PrimaryRole,
+    >::new(
+        primary_creation_time,
+        primary_signer.public_key().pk_algo(),
+        primary_signer.public_key().mpis().clone(),
+    )?);
+    let hsm_fpr = hsm_primary.fingerprint();
+    let cert_fpr = cert.primary_key().key().fingerprint();
+    if hsm_fpr != cert_fpr {
+        anyhow::bail!(
+            "primary fingerprint mismatch: --input-cert primary is {cert_fpr}, \
+             selected HSM primary is {hsm_fpr} \
+             (check --key-label/--creation-time match the input cert)"
+        );
+    }
 
     let spec = cert::SubkeyRevocationSpec {
         primary: cert::KeySpec {
@@ -907,30 +994,16 @@ fn cmd_subkey_revoke(
     write_revocation_output(&sig, args.binary, args.output.as_deref(), args.force)
 }
 
-/// Locate a subkey within an input cert by fingerprint or key ID.
+/// Parse a 40-hex-char OpenPGP fingerprint, with whitespace and an
+/// optional `0x` prefix stripped (handles strings copy-pasted from
+/// `gpg --fingerprint` output).
 ///
-/// Accepts either a 40-char hex fingerprint or a 16-char hex key ID.
-/// Whitespace and a leading `0x` are stripped before matching.
-/// Returns the subkey's public-material packet (with role
-/// `SubordinateRole`), suitable for handing to
-/// `cert::build_subkey_revocation` without any HSM access.
-fn locate_subkey_in_cert(
-    cert_path: &std::path::Path,
-    needle: &str,
-) -> anyhow::Result<
-    sequoia_openpgp::packet::Key<
-        sequoia_openpgp::packet::key::PublicParts,
-        sequoia_openpgp::packet::key::SubordinateRole,
-    >,
-> {
-    use sequoia_openpgp::{Fingerprint, KeyHandle, KeyID};
-
-    let bytes = std::fs::read(cert_path)
-        .with_context(|| format!("reading input cert {}", cert_path.display()))?;
-    let cert = cert::parse_cert(&bytes)?;
-
-    // Normalise the needle: strip whitespace, an optional 0x prefix, and
-    // surrounding spaces sometimes pasted from `gpg --fingerprint` output.
+/// Short 16-hex key IDs are intentionally NOT accepted: revocation is
+/// rare and high-stakes, and a hostile or malformed cert can carry a
+/// secondary subkey whose key ID aliases another, silently shifting
+/// the revocation to the wrong subkey.  Requiring the full fingerprint
+/// removes that ambiguity at the cost of a longer paste.
+fn parse_full_fingerprint(needle: &str) -> anyhow::Result<sequoia_openpgp::Fingerprint> {
     let cleaned: String = needle
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -938,26 +1011,35 @@ fn locate_subkey_in_cert(
         .trim_start_matches("0x")
         .trim_start_matches("0X")
         .to_string();
-    let target: KeyHandle = match cleaned.len() {
-        40 => Fingerprint::from_hex(&cleaned)
-            .with_context(|| format!("parsing --subkey-fingerprint {needle:?} as fingerprint"))?
-            .into(),
-        16 => KeyID::from_hex(&cleaned)
-            .with_context(|| format!("parsing --subkey-fingerprint {needle:?} as key ID"))?
-            .into(),
-        n => anyhow::bail!(
-            "--subkey-fingerprint must be either 40 hex chars (fingerprint) \
-             or 16 hex chars (key ID); got {n} chars"
-        ),
-    };
+    if cleaned.len() != 40 {
+        anyhow::bail!(
+            "{needle:?} is not a full OpenPGP fingerprint (got {} hex chars after \
+             stripping whitespace and 0x prefix; need exactly 40); short 16-char \
+             key IDs are not accepted because they are not collision-resistant",
+            cleaned.len()
+        );
+    }
+    sequoia_openpgp::Fingerprint::from_hex(&cleaned)
+        .with_context(|| format!("parsing {needle:?} as a 40-hex-char fingerprint"))
+}
 
+/// Locate a subkey within an already-parsed cert by full fingerprint.
+fn locate_subkey_in_cert(
+    cert: &sequoia_openpgp::Cert,
+    fingerprint: &sequoia_openpgp::Fingerprint,
+) -> anyhow::Result<
+    sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::SubordinateRole,
+    >,
+> {
     for sub in cert.keys().subkeys() {
         let key = sub.key();
-        if KeyHandle::from(key.fingerprint()).aliases(&target) {
+        if &key.fingerprint() == fingerprint {
             return Ok(key.clone().role_into_subordinate());
         }
     }
-    anyhow::bail!("no subkey in {} matches {needle:?}", cert_path.display(),)
+    anyhow::bail!("no subkey in the input cert matches fingerprint {fingerprint}")
 }
 
 /// Shared output handler for cert-revoke and subkey-revoke.
