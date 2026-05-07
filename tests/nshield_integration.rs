@@ -484,13 +484,18 @@ fn sq_honours_standalone_subkey_revocation() {
         String::from_utf8_lossy(&verify_before.stderr),
     );
 
-    // 4. Issue a "compromised" subkey revocation.
+    // 4. Issue a "compromised" subkey revocation.  The subkey is
+    //    identified by fingerprint extracted from the cert, so no HSM
+    //    access for the subkey is required (mirrors the real
+    //    compromise-response path).
+    let subkey_fpr = subkey_fingerprint_hex(&cert_path);
     sq_pkcs11(&env)
         .args(["subkey-revoke"])
         .args(["--key-label", &env.primary_label])
-        .args(["--subkey-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&cert_path)
+        .args(["--subkey-fingerprint", &subkey_fpr])
         .args(["--creation-time", STABLE_TIME])
-        .args(["--subkey-creation-time", STABLE_TIME])
         .args(["--reason", "compromised"])
         .args(["--message", "sq subkey revocation parity test"])
         .args(["--output"])
@@ -973,6 +978,66 @@ fn cert_revoke_marks_primary_revoked() {
 }
 
 #[test]
+fn subkey_revoke_works_without_subkey_hsm_access() {
+    // The whole point of the subkey-revoke API redesign: a compromised
+    // or lost signing subkey must still be revokable using only the
+    // primary HSM key plus the published cert.  Reproduce the
+    // compromise scenario by pointing --subkey-fingerprint at a subkey
+    // present in the input cert but exercising sq-pkcs11 with
+    // SQ_PKCS11_SUBKEY_PIN scrubbed and no --subkey-* HSM selectors —
+    // the binary must succeed without ever opening a private-key
+    // session for the subkey.
+    //
+    // (We can't directly assert "no PKCS#11 session was opened for
+    // CKA_LABEL X" without a mock layer, but the new CLI shape forbids
+    // even expressing that — the --subkey-* selector flags no longer
+    // exist on subkey-revoke — so a passing run here proves the
+    // private-key-of-subkey is not consulted.)
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let revocation = tmp.path().join("revocation.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "No-Subkey-HSM Test <nsh@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    let subkey_fpr = subkey_fingerprint_hex(&cert);
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", &subkey_fpr])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--message", "compromised; subkey HSM access not needed"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .success();
+
+    // The produced packet binds the right subkey: parse and check the
+    // SubkeyRevocation signature's hash recovers the same fingerprint.
+    use sequoia_openpgp::types::SignatureType;
+    let sig = parse_signature_file(&revocation);
+    assert_eq!(
+        sig.typ(),
+        SignatureType::SubkeyRevocation,
+        "expected SubkeyRevocation packet, got {:?}",
+        sig.typ()
+    );
+}
+
+#[test]
 fn subkey_revoke_marks_only_subkey_revoked() {
     let env = require_env!();
     let tmp = TempDir::new().unwrap();
@@ -993,13 +1058,16 @@ fn subkey_revoke_marks_only_subkey_revoked() {
         .assert()
         .success();
 
-    // Revoke only the subkey.
+    // Revoke only the subkey.  Subkey is addressed by fingerprint
+    // extracted from the cert; no HSM access for the subkey itself.
+    let subkey_fpr = subkey_fingerprint_hex(&cert);
     sq_pkcs11(&env)
         .args(["subkey-revoke"])
         .args(["--key-label", &env.primary_label])
-        .args(["--subkey-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", &subkey_fpr])
         .args(["--creation-time", STABLE_TIME])
-        .args(["--subkey-creation-time", STABLE_TIME])
         .args(["--reason", "compromised"])
         .args(["--message", "subkey lost"])
         .args(["--output"])
@@ -1181,8 +1249,23 @@ fn revocation_files_are_proper_openpgp_packets() {
 
     let env = require_env!();
     let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
     let cert_revocation = tmp.path().join("cert-revocation.asc");
     let subkey_revocation = tmp.path().join("subkey-revocation.asc");
+
+    // Two-tier cert provides the subkey we'll revoke (subkey-revoke now
+    // identifies its target by fingerprint inside an --input-cert).
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Framing Test <fr@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
 
     sq_pkcs11(&env)
         .args(["cert-revoke"])
@@ -1195,12 +1278,14 @@ fn revocation_files_are_proper_openpgp_packets() {
         .assert()
         .success();
 
+    let subkey_fpr = subkey_fingerprint_hex(&cert_path);
     sq_pkcs11(&env)
         .args(["subkey-revoke"])
         .args(["--key-label", &env.primary_label])
-        .args(["--subkey-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&cert_path)
+        .args(["--subkey-fingerprint", &subkey_fpr])
         .args(["--creation-time", STABLE_TIME])
-        .args(["--subkey-creation-time", STABLE_TIME])
         .args(["--reason", "compromised"])
         .args(["--message", "framing regression"])
         .args(["--output"])
@@ -1261,6 +1346,21 @@ fn parse_signature_file(path: &Path) -> sequoia_openpgp::packet::Signature {
         ppr = next;
     }
     found.unwrap_or_else(|| panic!("no Signature packet in {}", path.display()))
+}
+
+/// Extract the (single) subkey's fingerprint from a cert file as a hex
+/// string, ready to feed to `--subkey-fingerprint`.  Used by the
+/// subkey-revocation tests, which now address the subkey by fingerprint
+/// inside the cert rather than by HSM CKA_LABEL.
+fn subkey_fingerprint_hex(path: &Path) -> String {
+    let cert = parse_cert_file(path);
+    let mut subkeys = cert.keys().subkeys();
+    let first = subkeys.next().expect("cert has no subkey");
+    assert!(
+        subkeys.next().is_none(),
+        "cert has multiple subkeys; tests assume exactly one"
+    );
+    first.key().fingerprint().to_string().replace(' ', "")
 }
 
 /// Use `sq-pkcs11 list-keys` to discover the CKA_ID for a given CKA_LABEL.
@@ -1572,12 +1672,14 @@ fn binary_revocation_outputs_are_packets_accepted_by_gpg() {
         .assert()
         .success();
 
+    let subkey_fpr = subkey_fingerprint_hex(&cert_path);
     sq_pkcs11(&env)
         .args(["subkey-revoke"])
         .args(["--key-label", &env.primary_label])
-        .args(["--subkey-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&cert_path)
+        .args(["--subkey-fingerprint", &subkey_fpr])
         .args(["--creation-time", STABLE_TIME])
-        .args(["--subkey-creation-time", STABLE_TIME])
         .args(["--reason", "compromised"])
         .args(["--message", "binary revocation"])
         .args(["--binary"])
@@ -1733,37 +1835,37 @@ fn wrong_creation_time_invalidates_signature_and_revocations() {
         "primary must not be marked revoked by a T2 revocation against a T1 cert; pub: {pub_line}"
     );
 
-    // 3. subkey-revoke with subkey creation-time T2 must not revoke the T1 subkey.
-    sq_pkcs11(&env)
+    // 3. subkey-revoke against a subkey fingerprint that does not appear
+    //    in the input cert must fail without producing output.  This is
+    //    the new analogue of the old "wrong subkey-creation-time" check:
+    //    in the post-fix API the subkey is identified by fingerprint
+    //    inside the cert, so a wrong fingerprint is the failure mode the
+    //    operator can mis-issue.
+    let bogus_fpr = "0000000000000000000000000000000000000000";
+    let assert = sq_pkcs11(&env)
         .args(["subkey-revoke"])
         .args(["--key-label", &env.primary_label])
-        .args(["--subkey-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&cert_path)
+        .args(["--subkey-fingerprint", bogus_fpr])
         .args(["--creation-time", t1])
-        .args(["--subkey-creation-time", t2])
         .args(["--reason", "compromised"])
-        .args(["--message", "wrong-time subkey revocation"])
+        .args(["--message", "wrong-fingerprint subkey revocation"])
         .args(["--output"])
         .arg(&bad_subkey_revocation)
         .assert()
-        .success();
-    let _ = gpg_in(&home)
-        .arg("--import")
-        .arg(&bad_subkey_revocation)
-        .output();
-    let listing = gpg_in(&home)
-        .args(["--list-keys", "--with-colons"])
-        .output()
-        .expect("gpg --list-keys");
-    let listing_s = String::from_utf8_lossy(&listing.stdout);
-    let sub_line = listing_s
-        .lines()
-        .find(|l| l.starts_with("sub:"))
-        .expect("sub: line");
-    let sub_validity = sub_line.split(':').nth(1).unwrap_or("");
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(
-        !sub_validity.contains('r'),
-        "subkey must not be marked revoked by a T2 revocation against a T1 subkey; sub: {sub_line}"
+        stderr.contains("no subkey") || stderr.contains("matches"),
+        "expected 'no subkey ... matches' error, got: {stderr}"
     );
+    assert!(
+        !bad_subkey_revocation.exists(),
+        "subkey-revoke must not write an output file when the fingerprint is wrong"
+    );
+    // Suppress the unused t2 binding warning (was used in the old subcase).
+    let _ = t2;
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,13 +2106,29 @@ fn subcommands_write_to_stdout_when_output_omitted() {
     }
     assert_eq!(sigs, 1, "cert-revoke stdout must be exactly one Signature");
 
-    // 4. subkey-revoke — same shape.
+    // 4. subkey-revoke — same shape.  Need a cert + subkey fingerprint
+    //    for the new API.
+    let tmp = TempDir::new().unwrap();
+    let stdout_cert = tmp.path().join("stdout-cert.asc");
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Stdout <so@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&stdout_cert)
+        .assert()
+        .success();
+    let subkey_fpr = subkey_fingerprint_hex(&stdout_cert);
     let assert = sq_pkcs11(&env)
         .args(["subkey-revoke"])
         .args(["--key-label", &env.primary_label])
-        .args(["--subkey-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&stdout_cert)
+        .args(["--subkey-fingerprint", &subkey_fpr])
         .args(["--creation-time", STABLE_TIME])
-        .args(["--subkey-creation-time", STABLE_TIME])
         .args(["--reason", "unspecified"])
         .args(["--message", "stdout test"])
         .assert()

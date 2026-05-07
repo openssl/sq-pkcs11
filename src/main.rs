@@ -415,32 +415,19 @@ struct SubkeyRevokeArgs {
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
 
-    // ── Subkey selectors (mirror cert-export) ──────────────────────────
-    #[arg(long, value_name = "URI", group = "subkey_selector")]
-    subkey_uri: Option<String>,
-    #[arg(long, value_name = "LABEL", group = "subkey_selector")]
-    subkey_label: Option<String>,
-    #[arg(long, value_name = "HEX", group = "subkey_selector")]
-    subkey_id: Option<String>,
-    #[arg(long, group = "subkey_selector")]
-    subkey_auto: bool,
+    /// Path to the published certificate that contains the subkey to be
+    /// revoked.  The subkey's public material is read from this cert so
+    /// the HSM does not need to hold the subkey's private key — the
+    /// signing-subkey's secret can have been deleted, lost, or
+    /// compromised.  Only the primary's private key is exercised.
+    #[arg(long, value_name = "FILE")]
+    input_cert: PathBuf,
 
-    /// File containing the subkey passphrase.  Same semantics as
-    /// --pin-file; `SQ_PKCS11_SUBKEY_PIN` env var read when absent.
-    #[arg(
-        long,
-        value_name = "FILE",
-        group = "subkey_auth",
-        requires = "subkey_selector"
-    )]
-    subkey_pin_file: Option<PathBuf>,
-    #[arg(long, group = "subkey_auth", requires = "subkey_selector")]
-    subkey_ocs: bool,
-
-    /// Subkey creation time (RFC 3339).  Must match what was used in
-    /// the cert-export that produced this subkey.
-    #[arg(long, value_name = "TIMESTAMP", requires = "subkey_selector")]
-    subkey_creation_time: Option<String>,
+    /// Fingerprint (40 hex chars) or key ID (16 hex chars) identifying
+    /// which subkey within --input-cert to revoke.  Whitespace and `0x`
+    /// prefix are ignored.
+    #[arg(long, value_name = "FPR_OR_KEYID")]
+    subkey_fingerprint: String,
 
     /// Revocation reason code.
     #[arg(long, value_enum, value_name = "REASON")]
@@ -518,27 +505,6 @@ trait HasSubkeyArgs {
 }
 
 impl HasSubkeyArgs for CertExportArgs {
-    fn subkey_uri(&self) -> Option<&str> {
-        self.subkey_uri.as_deref()
-    }
-    fn subkey_label(&self) -> Option<&str> {
-        self.subkey_label.as_deref()
-    }
-    fn subkey_id(&self) -> Option<&str> {
-        self.subkey_id.as_deref()
-    }
-    fn subkey_auto(&self) -> bool {
-        self.subkey_auto
-    }
-    fn subkey_pin_file(&self) -> Option<&std::path::Path> {
-        self.subkey_pin_file.as_deref()
-    }
-    fn subkey_ocs(&self) -> bool {
-        self.subkey_ocs
-    }
-}
-
-impl HasSubkeyArgs for SubkeyRevokeArgs {
     fn subkey_uri(&self) -> Option<&str> {
         self.subkey_uri.as_deref()
     }
@@ -915,18 +881,15 @@ fn cmd_subkey_revoke(
         None => std::time::SystemTime::now(),
     };
 
-    let subkey_selector = resolve_subkey_selector(&args)?
-        .ok_or_else(|| anyhow::anyhow!("subkey-revoke requires a subkey selector"))?;
-    let subkey_login = build_subkey_login(&args, module)?;
-    let subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
+    // Read the published cert and find the subkey to revoke by
+    // fingerprint or key ID.  No HSM access for the subkey itself —
+    // this is what makes the compromise-response path work even when
+    // the signing-subkey's secret has been deleted, lost, or stolen.
+    let subkey_public = locate_subkey_in_cert(&args.input_cert, &args.subkey_fingerprint)?;
 
     let (primary_session, _) = session::open_session(pkcs11, &primary_selector, &primary_login)?;
     let primary_handle = session::resolve_single_key(&primary_session, &primary_selector)?;
     let mut primary_signer = Pkcs11Signer::new(primary_session, primary_handle)?;
-
-    let (sk_session, _) = session::open_session(pkcs11, &subkey_selector, &subkey_login)?;
-    let sk_handle = session::resolve_single_key(&sk_session, &subkey_selector)?;
-    let mut subkey_signer = Pkcs11Signer::new(sk_session, sk_handle)?;
 
     let spec = cert::SubkeyRevocationSpec {
         primary: cert::KeySpec {
@@ -934,11 +897,7 @@ fn cmd_subkey_revoke(
             creation_time: primary_creation_time,
             validity_period: None,
         },
-        subkey: cert::KeySpec {
-            signer: &mut subkey_signer,
-            creation_time: subkey_creation_time,
-            validity_period: None,
-        },
+        subkey_public,
         reason: args.reason.into(),
         message: args.message.as_bytes(),
         revocation_time,
@@ -946,6 +905,59 @@ fn cmd_subkey_revoke(
 
     let sig = cert::build_subkey_revocation(spec)?;
     write_revocation_output(&sig, args.binary, args.output.as_deref(), args.force)
+}
+
+/// Locate a subkey within an input cert by fingerprint or key ID.
+///
+/// Accepts either a 40-char hex fingerprint or a 16-char hex key ID.
+/// Whitespace and a leading `0x` are stripped before matching.
+/// Returns the subkey's public-material packet (with role
+/// `SubordinateRole`), suitable for handing to
+/// `cert::build_subkey_revocation` without any HSM access.
+fn locate_subkey_in_cert(
+    cert_path: &std::path::Path,
+    needle: &str,
+) -> anyhow::Result<
+    sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::SubordinateRole,
+    >,
+> {
+    use sequoia_openpgp::{Fingerprint, KeyHandle, KeyID};
+
+    let bytes = std::fs::read(cert_path)
+        .with_context(|| format!("reading input cert {}", cert_path.display()))?;
+    let cert = cert::parse_cert(&bytes)?;
+
+    // Normalise the needle: strip whitespace, an optional 0x prefix, and
+    // surrounding spaces sometimes pasted from `gpg --fingerprint` output.
+    let cleaned: String = needle
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_string();
+    let target: KeyHandle = match cleaned.len() {
+        40 => Fingerprint::from_hex(&cleaned)
+            .with_context(|| format!("parsing --subkey-fingerprint {needle:?} as fingerprint"))?
+            .into(),
+        16 => KeyID::from_hex(&cleaned)
+            .with_context(|| format!("parsing --subkey-fingerprint {needle:?} as key ID"))?
+            .into(),
+        n => anyhow::bail!(
+            "--subkey-fingerprint must be either 40 hex chars (fingerprint) \
+             or 16 hex chars (key ID); got {n} chars"
+        ),
+    };
+
+    for sub in cert.keys().subkeys() {
+        let key = sub.key();
+        if KeyHandle::from(key.fingerprint()).aliases(&target) {
+            return Ok(key.clone().role_into_subordinate());
+        }
+    }
+    anyhow::bail!("no subkey in {} matches {needle:?}", cert_path.display(),)
 }
 
 /// Shared output handler for cert-revoke and subkey-revoke.

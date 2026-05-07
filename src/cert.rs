@@ -197,12 +197,17 @@ pub struct CertRevocationSpec<'a> {
     pub revocation_time: std::time::SystemTime,
 }
 
-/// Inputs for subkey revocation.  Both the primary (which signs) and the
-/// subkey (whose public material we hash over) must be supplied; only the
-/// primary signs the resulting signature.
+/// Inputs for subkey revocation.  Only the primary's *private* key is
+/// needed to sign — the subkey is identified by its public material,
+/// which can come from the published certificate without HSM access to
+/// the subkey itself.  This is critical for the compromise-response
+/// path: a lost or compromised subkey can still be revoked as long as
+/// the primary signing key is reachable.
 pub struct SubkeyRevocationSpec<'a> {
     pub primary: KeySpec<'a>,
-    pub subkey: KeySpec<'a>,
+    /// Public material of the subkey being revoked.  Its embedded
+    /// creation time is used as-is (no `set_creation_time` rewrite).
+    pub subkey_public: Key<PublicParts, SubordinateRole>,
     pub reason: ReasonForRevocation,
     pub message: &'a [u8],
     pub revocation_time: std::time::SystemTime,
@@ -234,23 +239,20 @@ pub fn build_cert_revocation(spec: CertRevocationSpec<'_>) -> Result<Signature> 
 }
 
 /// Build a standalone subkey revocation signature.
+///
+/// Only the primary's private key is exercised — `spec.subkey_public`
+/// carries enough information to hash over the right subkey.  The subkey
+/// itself does not need to be reachable on the HSM; the public material
+/// can come from the published certificate.
 pub fn build_subkey_revocation(spec: SubkeyRevocationSpec<'_>) -> Result<Signature> {
     spec.primary
         .signer
         .set_creation_time(spec.primary.creation_time)?;
-    spec.subkey
-        .signer
-        .set_creation_time(spec.subkey.creation_time)?;
 
     let primary_key = sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, PrimaryRole>::new(
         spec.primary.creation_time,
         spec.primary.signer.public_key().pk_algo(),
         spec.primary.signer.public_key().mpis().clone(),
-    )?);
-    let subkey_key = sequoia_openpgp::packet::Key::V4(Key4::<PublicParts, SubordinateRole>::new(
-        spec.subkey.creation_time,
-        spec.subkey.signer.public_key().pk_algo(),
-        spec.subkey.signer.public_key().mpis().clone(),
     )?);
     let cert = Cert::try_from(vec![Packet::PublicKey(primary_key)])?;
 
@@ -259,7 +261,12 @@ pub fn build_subkey_revocation(spec: SubkeyRevocationSpec<'_>) -> Result<Signatu
     let sig = SubkeyRevocationBuilder::new()
         .set_signature_creation_time(spec.revocation_time)?
         .set_reason_for_revocation(spec.reason, spec.message)?
-        .build(spec.primary.signer, &cert, &subkey_key, primary_hash)?;
+        .build(
+            spec.primary.signer,
+            &cert,
+            &spec.subkey_public,
+            primary_hash,
+        )?;
 
     Ok(sig)
 }
