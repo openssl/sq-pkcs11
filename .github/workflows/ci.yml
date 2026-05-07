@@ -35,5 +35,14 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-      - name: Run tests
-        run: cargo test --release
+      # Compile every test (including the nShield integration tests in
+      # tests/nshield_integration.rs) so a refactor that breaks them gets
+      # caught here, even though the runner has no HSM to actually run them.
+      - name: Compile-check all tests (release)
+        run: cargo test --release --no-run
+
+      # Run only the unit tests in src/.  The nShield integration tests
+      # are excluded from the run because they would all early-return via
+      # require_env!() and report as "ok" — confusing log noise.
+      - name: Run unit tests (release)
+        run: cargo test --release --bins

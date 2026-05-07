@@ -5,9 +5,15 @@
 //! points at `libcknfast.so`, and that the test keys exist (see
 //! `tests/nshield/README.md` for provisioning).
 //!
-//! All tests skip silently when `tests/nshield/test.env` is absent or
-//! incomplete, so this file is safe to compile and run on a developer
-//! machine without an HSM.
+//! Each test early-returns with a `skipping:` line on stderr when
+//! `tests/nshield/test.env` is absent / incomplete, or when the configured
+//! `PKCS11_MODULE_PATH` does not point at an existing file (vendor client
+//! not installed).  Rust's libtest has no native "skipped" status, so the
+//! tests still report as "ok" — the stderr message is the only signal.
+//!
+//! In CI, the workflow runs `cargo test --bins` which excludes this file
+//! entirely, so the misleading "ok" is only ever seen when a developer
+//! runs `cargo test` locally without an HSM environment.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -31,10 +37,14 @@ struct TestEnv {
 }
 
 /// Load `tests/nshield/test.env` into the process environment exactly once,
-/// then read the labels we need.  Returns `None` if the file is missing or
-/// any required variable is unset — the calling test will print a skip
-/// message and return.
-fn test_env() -> Option<TestEnv> {
+/// then read the labels we need.  Returns `Err(reason)` when the suite
+/// cannot run — typically because `tests/nshield/test.env` is absent (CI
+/// machines, dev workstations without an HSM) or because the configured
+/// PKCS#11 module file does not exist (vendor client not installed).
+/// Rust's `libtest` has no native "skipped" status, so the calling test
+/// prints `reason` on stderr and early-returns; the line shows up in CI
+/// logs even though the test still reports as "ok".
+fn test_env() -> Result<TestEnv, &'static str> {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let env_file: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "nshield", "test.env"]
@@ -43,26 +53,46 @@ fn test_env() -> Option<TestEnv> {
         let _ = dotenvy::from_path(&env_file);
     });
 
-    Some(TestEnv {
-        module_path: std::env::var("PKCS11_MODULE_PATH").ok()?,
-        rsa_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_RSA").ok()?,
-        ec_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_EC").ok()?,
-        primary_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_PRIMARY").ok()?,
-        subkey_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_SUBKEY").ok()?,
-        subkey2_label: std::env::var("SQ_PKCS11_NSHIELD_TEST_SUBKEY2").ok()?,
+    let module_path = std::env::var("PKCS11_MODULE_PATH").map_err(|_| {
+        "PKCS11_MODULE_PATH not set (tests/nshield/test.env missing or incomplete?)"
+    })?;
+    if !Path::new(&module_path).exists() {
+        return Err("PKCS#11 module file from PKCS11_MODULE_PATH does not exist (nShield client not installed?)");
+    }
+
+    let var = |name: &str, missing: &'static str| std::env::var(name).map_err(move |_| missing);
+    Ok(TestEnv {
+        module_path,
+        rsa_label: var(
+            "SQ_PKCS11_NSHIELD_TEST_RSA",
+            "SQ_PKCS11_NSHIELD_TEST_RSA not set in tests/nshield/test.env",
+        )?,
+        ec_label: var(
+            "SQ_PKCS11_NSHIELD_TEST_EC",
+            "SQ_PKCS11_NSHIELD_TEST_EC not set in tests/nshield/test.env",
+        )?,
+        primary_label: var(
+            "SQ_PKCS11_NSHIELD_TEST_PRIMARY",
+            "SQ_PKCS11_NSHIELD_TEST_PRIMARY not set in tests/nshield/test.env",
+        )?,
+        subkey_label: var(
+            "SQ_PKCS11_NSHIELD_TEST_SUBKEY",
+            "SQ_PKCS11_NSHIELD_TEST_SUBKEY not set in tests/nshield/test.env",
+        )?,
+        subkey2_label: var(
+            "SQ_PKCS11_NSHIELD_TEST_SUBKEY2",
+            "SQ_PKCS11_NSHIELD_TEST_SUBKEY2 not set in tests/nshield/test.env",
+        )?,
     })
 }
 
-/// Macro to bail out cleanly when the env isn't available.
+/// Macro to bail out cleanly when the test environment isn't available.
 macro_rules! require_env {
     () => {
         match test_env() {
-            Some(e) => e,
-            None => {
-                eprintln!(
-                    "skipping: tests/nshield/test.env not present or incomplete \
-                     — see tests/nshield/README.md"
-                );
+            Ok(e) => e,
+            Err(why) => {
+                eprintln!("skipping: {why}");
                 return;
             }
         }
