@@ -152,29 +152,70 @@ pub fn read_public_key(
     }
 }
 
-/// Find the CKO_PUBLIC_KEY object that shares CKA_ID with a private key object.
+/// Find the CKO_PUBLIC_KEY object paired with a private key object.
 ///
-/// PKCS#11 mandates that key pairs share a CKA_ID value.  Public key attributes
-/// such as CKA_EC_POINT are only guaranteed to be present on the public key
-/// object, not the private key object.
+/// PKCS#11 keypairs are conventionally identified by sharing a CKA_ID value
+/// (and usually CKA_LABEL).  Public-only attributes such as CKA_EC_POINT
+/// live on the public-key object, so EC operations need the companion
+/// public-key handle.
+///
+/// Match strategy, in order of strictness:
+///   1. CKA_ID + CKA_LABEL — the strongest identifier when both are
+///      populated.  nShield assigns these together for keys generated via
+///      `generatekey pkcs11`.
+///   2. CKA_ID only — fallback when the private key has no CKA_LABEL or
+///      libraries that don't propagate it.
+///   3. CKA_LABEL only — fallback when CKA_ID is empty (nShield has been
+///      observed to assign zero-byte CKA_IDs to some EC keys).
+///
+/// In every case the result MUST be exactly one match.  Multiple matches
+/// (or zero matches) are an error: silently picking the first would risk
+/// pairing private key A with public key B when their CKA_IDs collide on
+/// empty values.
 fn find_companion_public_key(session: &Session, priv_handle: ObjectHandle) -> Result<ObjectHandle> {
-    let id_attr = session
-        .get_attributes(priv_handle, &[AttributeType::Id])?
-        .into_iter()
-        .find_map(|a| match a {
-            Attribute::Id(v) => Some(v),
-            _ => None,
-        })
-        .ok_or_else(|| Error::UnsupportedKeyType("private key has no CKA_ID".into()))?;
+    let attrs = session.get_attributes(priv_handle, &[AttributeType::Id, AttributeType::Label])?;
+    let mut id: Option<Vec<u8>> = None;
+    let mut label: Option<Vec<u8>> = None;
+    for a in attrs {
+        match a {
+            Attribute::Id(v) if !v.is_empty() => id = Some(v),
+            Attribute::Label(v) if !v.is_empty() => label = Some(v),
+            _ => {}
+        }
+    }
 
-    let candidates = session.find_objects(&[
-        Attribute::Class(ObjectClass::PUBLIC_KEY),
-        Attribute::Id(id_attr),
-    ])?;
+    let template: Vec<Attribute> = match (id.clone(), label.clone()) {
+        (Some(i), Some(l)) => vec![
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+            Attribute::Id(i),
+            Attribute::Label(l),
+        ],
+        (Some(i), None) => vec![Attribute::Class(ObjectClass::PUBLIC_KEY), Attribute::Id(i)],
+        (None, Some(l)) => vec![
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+            Attribute::Label(l),
+        ],
+        (None, None) => {
+            return Err(Error::UnsupportedKeyType(
+                "private key has neither CKA_ID nor CKA_LABEL set; cannot locate \
+                 companion public key unambiguously"
+                    .into(),
+            ));
+        }
+    };
 
-    candidates.into_iter().next().ok_or_else(|| {
-        Error::UnsupportedKeyType("no CKO_PUBLIC_KEY object found with matching CKA_ID".into())
-    })
+    let candidates = session.find_objects(&template)?;
+    match candidates.len() {
+        1 => Ok(candidates.into_iter().next().expect("len == 1")),
+        0 => Err(Error::UnsupportedKeyType(
+            "no CKO_PUBLIC_KEY object matched the private key's CKA_ID/CKA_LABEL".into(),
+        )),
+        n => Err(Error::UnsupportedKeyType(format!(
+            "ambiguous companion public-key lookup: {n} CKO_PUBLIC_KEY objects matched the \
+             private key's CKA_ID/CKA_LABEL — refusing to pick one to avoid binding the wrong \
+             public material"
+        ))),
+    }
 }
 
 /// Compute the bit-length of a big-endian unsigned integer (CKA_MODULUS form).
