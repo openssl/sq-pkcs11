@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use assert_cmd::Command;
 use tempfile::TempDir;
@@ -36,54 +36,91 @@ struct TestEnv {
     subkey2_label: String,
 }
 
-/// Load `tests/nshield/test.env` into the process environment exactly once,
-/// then read the labels we need.  Returns `Err(reason)` when the suite
-/// cannot run — typically because `tests/nshield/test.env` is absent (CI
-/// machines, dev workstations without an HSM) or because the configured
-/// PKCS#11 module file does not exist (vendor client not installed).
-/// Rust's `libtest` has no native "skipped" status, so the calling test
-/// prints `reason` on stderr and early-returns; the line shows up in CI
-/// logs even though the test still reports as "ok".
-fn test_env() -> Result<TestEnv, &'static str> {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let env_file: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "nshield", "test.env"]
-            .iter()
-            .collect();
-        let _ = dotenvy::from_path(&env_file);
-    });
+/// Load `tests/nshield/test.env`, read the labels we need, and verify each
+/// label actually corresponds to a key present in the Security World.
+/// Returns `Err(reason)` for any of:
+///   - `tests/nshield/test.env` absent / incomplete (CI, dev machines)
+///   - `PKCS11_MODULE_PATH` does not exist (nShield client not installed)
+///   - `sq-pkcs11 list-keys` fails (HSM unreachable)
+///   - any configured CKA_LABEL is not present in the token
+///
+/// The result is cached for the lifetime of the test process so the
+/// list-keys probe only runs once even with `cargo test`'s parallel test
+/// execution.  Rust's libtest has no native "skipped" status, so the
+/// calling test prints `reason` on stderr and early-returns; the line
+/// shows up in test logs even though the test still reports as "ok".
+fn test_env() -> Result<TestEnv, String> {
+    static CACHE: OnceLock<Result<TestEnv, String>> = OnceLock::new();
+    CACHE.get_or_init(compute_test_env).clone()
+}
+
+fn compute_test_env() -> Result<TestEnv, String> {
+    let env_file: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "nshield", "test.env"]
+        .iter()
+        .collect();
+    let _ = dotenvy::from_path(&env_file);
 
     let module_path = std::env::var("PKCS11_MODULE_PATH").map_err(|_| {
-        "PKCS11_MODULE_PATH not set (tests/nshield/test.env missing or incomplete?)"
+        "PKCS11_MODULE_PATH not set (tests/nshield/test.env missing or incomplete?)".to_string()
     })?;
     if !Path::new(&module_path).exists() {
-        return Err("PKCS#11 module file from PKCS11_MODULE_PATH does not exist (nShield client not installed?)");
+        return Err(
+            "PKCS#11 module file from PKCS11_MODULE_PATH does not exist (nShield client not installed?)"
+                .to_string(),
+        );
     }
 
-    let var = |name: &str, missing: &'static str| std::env::var(name).map_err(move |_| missing);
-    Ok(TestEnv {
-        module_path,
-        rsa_label: var(
-            "SQ_PKCS11_NSHIELD_TEST_RSA",
-            "SQ_PKCS11_NSHIELD_TEST_RSA not set in tests/nshield/test.env",
-        )?,
-        ec_label: var(
-            "SQ_PKCS11_NSHIELD_TEST_EC",
-            "SQ_PKCS11_NSHIELD_TEST_EC not set in tests/nshield/test.env",
-        )?,
-        primary_label: var(
-            "SQ_PKCS11_NSHIELD_TEST_PRIMARY",
-            "SQ_PKCS11_NSHIELD_TEST_PRIMARY not set in tests/nshield/test.env",
-        )?,
-        subkey_label: var(
-            "SQ_PKCS11_NSHIELD_TEST_SUBKEY",
-            "SQ_PKCS11_NSHIELD_TEST_SUBKEY not set in tests/nshield/test.env",
-        )?,
-        subkey2_label: var(
-            "SQ_PKCS11_NSHIELD_TEST_SUBKEY2",
-            "SQ_PKCS11_NSHIELD_TEST_SUBKEY2 not set in tests/nshield/test.env",
-        )?,
-    })
+    let var = |name: &str| {
+        std::env::var(name).map_err(|_| format!("{name} not set in tests/nshield/test.env"))
+    };
+    let env = TestEnv {
+        module_path: module_path.clone(),
+        rsa_label: var("SQ_PKCS11_NSHIELD_TEST_RSA")?,
+        ec_label: var("SQ_PKCS11_NSHIELD_TEST_EC")?,
+        primary_label: var("SQ_PKCS11_NSHIELD_TEST_PRIMARY")?,
+        subkey_label: var("SQ_PKCS11_NSHIELD_TEST_SUBKEY")?,
+        subkey2_label: var("SQ_PKCS11_NSHIELD_TEST_SUBKEY2")?,
+    };
+
+    // Confirm each configured label actually exists in the Security World.
+    // Without this, a stale or placeholder test.env happily passes the
+    // env-var check above, every test then runs and either fails noisily
+    // ("key not found") or — worse — short-circuits in a way that makes
+    // it look like the suite ran.  Catch it once here.
+    let listing = std::process::Command::new(assert_cmd::cargo::cargo_bin("sq-pkcs11"))
+        .arg("list-keys")
+        .env("PKCS11_MODULE_PATH", &env.module_path)
+        .env_remove("SQ_PKCS11_PIN")
+        .env_remove("SQ_PKCS11_SUBKEY_PIN")
+        .output()
+        .map_err(|e| format!("could not run sq-pkcs11 list-keys: {e}"))?;
+    if !listing.status.success() {
+        return Err(format!(
+            "sq-pkcs11 list-keys failed (HSM unreachable?):\nstderr: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&listing.stdout);
+    for (var_name, label) in [
+        ("SQ_PKCS11_NSHIELD_TEST_RSA", &env.rsa_label),
+        ("SQ_PKCS11_NSHIELD_TEST_EC", &env.ec_label),
+        ("SQ_PKCS11_NSHIELD_TEST_PRIMARY", &env.primary_label),
+        ("SQ_PKCS11_NSHIELD_TEST_SUBKEY", &env.subkey_label),
+        ("SQ_PKCS11_NSHIELD_TEST_SUBKEY2", &env.subkey2_label),
+    ] {
+        // sq-pkcs11 list-keys prints `  label="<value>"  id=<hex>  type=<...>`
+        // — match the quoted form so a label that is a substring of another
+        // label can't pass.
+        let needle = format!("label={label:?}");
+        if !stdout.contains(&needle) {
+            return Err(format!(
+                "{var_name}={label} is not present in the Security World; \
+                 check tests/nshield/test.env and run sq-pkcs11 list-keys to verify"
+            ));
+        }
+    }
+
+    Ok(env)
 }
 
 /// Macro to bail out cleanly when the test environment isn't available.
