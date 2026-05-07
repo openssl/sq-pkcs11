@@ -11,7 +11,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use sequoia_openpgp::{
-    packet::signature::SignatureBuilder, serialize::stream::*, types::SignatureType,
+    armor, packet::signature::SignatureBuilder, serialize::stream::*, types::SignatureType,
 };
 
 use session::{KeySelector, LoginMode, Pkcs11Uri};
@@ -669,10 +669,15 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
     let mut sig_buf = Vec::new();
     {
         let sink = Message::new(&mut sig_buf);
+        // Armorer defaults to Kind::Message which would emit
+        // `-----BEGIN PGP MESSAGE-----`.  A detached signature must be
+        // wrapped in Kind::Signature so verifiers (and `sq inspect`) see
+        // `-----BEGIN PGP SIGNATURE-----` and treat the bytes as a
+        // standalone signature rather than an OpenPGP message.
         let sink = if args.binary {
             sink
         } else {
-            Armorer::new(sink).build()?
+            Armorer::new(sink).kind(armor::Kind::Signature).build()?
         };
         let template = SignatureBuilder::new(SignatureType::Binary).set_hash_algo(hash_algo);
         let mut signing_stream = Signer::with_template(sink, signer, template)?
