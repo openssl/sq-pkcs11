@@ -283,18 +283,42 @@ Primary-key revocation (entire cert is dead):
   --output        release-revocation.asc
 ```
 
-Subkey revocation (cert remains valid; one subkey is retired):
+Subkey revocation (cert remains valid; one subkey is retired).
+The subkey is identified by full 40-hex fingerprint inside the
+published cert, **not** by HSM CKA_LABEL — so this works even when
+the subkey's private material has been deleted, lost, or compromised:
 
 ```sh
+# Look up the subkey fingerprint in the published cert first:
+sq inspect release.asc                 # or
+gpg --list-keys --with-subkey-fingerprint
+
 ./sq-pkcs11 subkey-revoke \
   --key-label              openssl-release-primary --ocs \
-  --subkey-label           openssl-release-sign-2026 \
   --creation-time          2026-05-01T00:00:00Z \
-  --subkey-creation-time   2026-05-01T00:00:00Z \
+  --input-cert             release.asc \
+  --subkey-fingerprint     70F222DB97E8304B93112F1B998B87DB3AFDA5A8 \
   --reason                 superseded \
   --message                "rotated to openssl-release-sign-2027" \
   --output                 sign-2026-revocation.asc
 ```
+
+`subkey-revoke` exercises only the primary's private key in the HSM.
+The subkey's public material is read from `--input-cert`; the subkey
+itself is never opened.  This is deliberate: the typical reason to
+revoke a signing subkey is that its secret has been compromised or
+lost, in which case a tool that demanded HSM access to that secret
+would be useless.
+
+`sq-pkcs11` also verifies that the `--input-cert`'s primary
+fingerprint matches the HSM-derived primary fingerprint before
+signing, so an operator who picks the wrong `--key-label` /
+`--creation-time` cannot accidentally produce a revocation signed by
+the wrong primary key.
+
+Short 16-hex key IDs are not accepted for `--subkey-fingerprint`;
+they are not collision-resistant and a malformed cert could carry an
+ambiguous alias.  The full 40-hex fingerprint is required.
 
 `--reason` accepts:
 
