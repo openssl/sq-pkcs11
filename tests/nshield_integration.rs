@@ -267,6 +267,52 @@ fn ec_sign_verify_with_gpg() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn sign_output_dash_streams_to_stdout() {
+    use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
+    use sequoia_openpgp::Packet;
+
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let payload = tmp.path().join("p.txt");
+    std::fs::write(&payload, b"stdout streaming test\n").unwrap();
+
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output", "-"])
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout UTF-8");
+    assert!(
+        stdout.starts_with("-----BEGIN PGP SIGNATURE-----"),
+        "armored sig on stdout did not start with PGP armor:\n{stdout}"
+    );
+
+    let mut ppr = PacketParser::from_bytes(stdout.as_bytes()).expect("dearmor stdout");
+    let mut sigs = 0;
+    while let PacketParserResult::Some(pp) = ppr {
+        let (packet, next) = pp.recurse().expect("packet recurse");
+        if matches!(packet, Packet::Signature(_)) {
+            sigs += 1;
+        }
+        ppr = next;
+    }
+    assert_eq!(sigs, 1, "expected exactly one Signature on stdout");
+
+    // No side-artifact next to the input — --output - must not also write
+    // payload.txt.asc.
+    let derived = payload.with_extension("txt.asc");
+    assert!(
+        !derived.exists(),
+        "--output - must not also write {}",
+        derived.display()
+    );
+}
+
+#[test]
 fn sign_binary_produces_non_armored_output() {
     let env = require_env!();
     let tmp = TempDir::new().unwrap();

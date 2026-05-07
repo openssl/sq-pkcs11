@@ -161,7 +161,10 @@ struct SignArgs {
     #[arg(value_name = "FILE")]
     file: PathBuf,
 
-    /// Write signature to this path (default: <input>.asc).
+    /// Write signature to this path (default: <input>.asc).  Pass `-` to
+    /// stream the signature to stdout instead of writing a file — useful
+    /// when the wrapping script (e.g. a `git config gpg.program` shim)
+    /// needs to capture the signature without a temp-file dance.
     #[arg(long, short = 'o', value_name = "FILE")]
     output: Option<PathBuf>,
 
@@ -646,15 +649,22 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
     let data =
         std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
 
-    let sig_path = args.output.unwrap_or_else(|| {
-        let mut p = args.file.clone();
-        let new_ext = match p.extension().and_then(|e| e.to_str()) {
-            Some(ext) => format!("{ext}.asc"),
-            None => "asc".into(),
-        };
-        p.set_extension(new_ext);
-        p
-    });
+    // Decide where the signature goes before we actually sign, so we can
+    // catch a "refuse to overwrite" condition for file output without
+    // having spent an HSM round-trip.
+    let output_target = match args.output.as_deref() {
+        Some(p) if p == std::path::Path::new("-") => SignOutput::Stdout,
+        Some(p) => SignOutput::File(p.to_path_buf()),
+        None => {
+            let mut p = args.file.clone();
+            let new_ext = match p.extension().and_then(|e| e.to_str()) {
+                Some(ext) => format!("{ext}.asc"),
+                None => "asc".into(),
+            };
+            p.set_extension(new_ext);
+            SignOutput::File(p)
+        }
+    };
 
     let mut sig_buf = Vec::new();
     {
@@ -672,10 +682,24 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
         signing_stream.finalize()?;
     }
 
-    std::fs::write(&sig_path, &sig_buf)
-        .with_context(|| format!("writing signature to {}", sig_path.display()))?;
-    eprintln!("Signature written to {}", sig_path.display());
+    match output_target {
+        SignOutput::Stdout => {
+            std::io::stdout()
+                .write_all(&sig_buf)
+                .context("writing signature to stdout")?;
+        }
+        SignOutput::File(sig_path) => {
+            std::fs::write(&sig_path, &sig_buf)
+                .with_context(|| format!("writing signature to {}", sig_path.display()))?;
+            eprintln!("Signature written to {}", sig_path.display());
+        }
+    }
     Ok(())
+}
+
+enum SignOutput {
+    Stdout,
+    File(PathBuf),
 }
 
 // ---------------------------------------------------------------------------
