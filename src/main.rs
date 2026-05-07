@@ -994,12 +994,17 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
         for handle in handles {
             let label = get_str_attr(&session, handle, AttributeType::Label)
                 .unwrap_or_else(|| "<no label>".into());
+            // Treat both "no Id attribute" and "Id attribute with zero
+            // bytes" as missing — nShield assigns an empty CKA_ID to some
+            // EC keys, and a literal `id=` followed by whitespace would
+            // confuse downstream parsers (e.g. the integration tests that
+            // grep this output for the hex id of a label).
             let id = session
                 .get_attributes(handle, &[AttributeType::Id])
                 .ok()
                 .and_then(|attrs| {
                     attrs.into_iter().find_map(|a| match a {
-                        Attribute::Id(v) => Some(hex::encode(v)),
+                        Attribute::Id(v) if !v.is_empty() => Some(hex::encode(v)),
                         _ => None,
                     })
                 })

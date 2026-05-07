@@ -961,8 +961,12 @@ fn parse_signature_file(path: &Path) -> sequoia_openpgp::packet::Signature {
 }
 
 /// Use `sq-pkcs11 list-keys` to discover the CKA_ID for a given CKA_LABEL.
-/// Output line format: `  label="..."  id=HEX  type=...`.
-fn cka_id_for_label(env: &TestEnv, label: &str) -> String {
+/// Output line format: `  label="..."  id=HEX  type=...`.  Returns `None`
+/// if the key has no CKA_ID populated (nShield's `generatekey` does not
+/// always set one — empty CKA_ID has been observed on EC keys).  The
+/// caller is expected to handle that case; the --key-id selector is
+/// inapplicable to such a key.
+fn cka_id_for_label(env: &TestEnv, label: &str) -> Option<String> {
     let assert = sq_pkcs11(env).arg("list-keys").assert().success();
     let stdout =
         String::from_utf8(assert.get_output().stdout.clone()).expect("list-keys stdout is UTF-8");
@@ -973,11 +977,16 @@ fn cka_id_for_label(env: &TestEnv, label: &str) -> String {
         }
         if let Some(id_field) = line.split("id=").nth(1) {
             if let Some(id) = id_field.split_whitespace().next() {
-                return id.to_string();
+                // Validate hex — list-keys prints `<no id>` (or, formerly,
+                // an empty string) when the attribute is absent; we must
+                // not pass that on as if it were a real id.
+                if !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(id.to_string());
+                }
             }
         }
     }
-    panic!("could not find id for label {label} in list-keys output:\n{stdout}");
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1517,14 +1526,34 @@ fn key_selector_forms_resolve_same_key() {
     let by_id = tmp.path().join("by-id.asc");
     let by_uri = tmp.path().join("by-uri.asc");
 
-    let id_hex = cka_id_for_label(&env, &env.ec_label);
-    let uri = format!("pkcs11:object={};type=private", env.ec_label);
+    // Pick a label whose key actually has a CKA_ID populated.  nShield
+    // sometimes leaves CKA_ID empty (notably on EC keys generated via
+    // `generatekey pkcs11`), in which case the --key-id selector is
+    // inapplicable.  Prefer the EC key when it has an id (preserves the
+    // original test intent), but fall back to the RSA / primary keys.
+    let candidates = [
+        ("EC", &env.ec_label),
+        ("RSA", &env.rsa_label),
+        ("primary", &env.primary_label),
+    ];
+    let (kind, label, id_hex) = candidates
+        .iter()
+        .find_map(|(kind, label)| cka_id_for_label(&env, label).map(|id| (*kind, *label, id)))
+        .unwrap_or_else(|| {
+            panic!(
+                "no test key has a populated CKA_ID — re-generate at least one of \
+                 {:?} with a non-empty id so the --key-id selector can be exercised",
+                candidates.iter().map(|(_, l)| l).collect::<Vec<_>>(),
+            )
+        });
+    eprintln!("key_selector_forms_resolve_same_key: using {kind} key {label:?} (id={id_hex})");
 
+    let uri = format!("pkcs11:object={};type=private", label);
     let userid = "Selector <sel@example.com>";
 
     sq_pkcs11(&env)
         .args(["cert-export"])
-        .args(["--key-label", &env.ec_label])
+        .args(["--key-label", label])
         .args(["--userid", userid])
         .args(["--creation-time", STABLE_TIME])
         .args(["--output"])
