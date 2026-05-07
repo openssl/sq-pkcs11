@@ -173,6 +173,12 @@ struct SignArgs {
     #[arg(long)]
     binary: bool,
 
+    /// Overwrite the output file if it already exists.  Without this flag,
+    /// sq-pkcs11 refuses to overwrite an existing file — protects against
+    /// accidentally clobbering a previously-signed release artefact.
+    #[arg(long)]
+    force: bool,
+
     /// Key creation time used to compute the OpenPGP fingerprint embedded in
     /// the signature's issuer field (RFC 3339, e.g. 2026-04-30T16:29:30Z).
     ///
@@ -229,6 +235,12 @@ struct CertExportArgs {
     /// Output a binary OpenPGP certificate instead of ASCII-armored.
     #[arg(long)]
     binary: bool,
+
+    /// Overwrite the output file if it already exists.  Without this flag,
+    /// sq-pkcs11 refuses to overwrite an existing file — protects against
+    /// accidentally clobbering a previously-published certificate.
+    #[arg(long)]
+    force: bool,
 
     /// Key creation time to embed in the certificate (RFC 3339,
     /// e.g. 2026-04-30T16:29:30Z).
@@ -383,6 +395,12 @@ struct CertRevokeArgs {
     /// Output a binary OpenPGP signature packet instead of ASCII-armored.
     #[arg(long)]
     binary: bool,
+
+    /// Overwrite the output file if it already exists.  Without this flag,
+    /// sq-pkcs11 refuses to overwrite an existing file — protects against
+    /// accidentally clobbering a previously-issued revocation.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args)]
@@ -441,6 +459,12 @@ struct SubkeyRevokeArgs {
 
     #[arg(long)]
     binary: bool,
+
+    /// Overwrite the output file if it already exists.  Without this flag,
+    /// sq-pkcs11 refuses to overwrite an existing file — protects against
+    /// accidentally clobbering a previously-issued revocation.
+    #[arg(long)]
+    force: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +636,39 @@ fn parse_creation_time(s: Option<&str>) -> anyhow::Result<std::time::SystemTime>
     }
 }
 
+/// Write `bytes` to `path`, refusing to overwrite an existing file unless
+/// `force` is set.  Used by every command that writes a non-stdout output —
+/// signatures, certs, revocation files — so a stale `release.asc` cannot be
+/// silently replaced by an accidental rerun.
+fn write_or_refuse(path: &std::path::Path, bytes: &[u8], force: bool) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let result = if force {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let mut file = result.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "refusing to overwrite existing file {}; pass --force to overwrite",
+                path.display()
+            )
+        } else {
+            anyhow::Error::from(e).context(format!("opening {} for writing", path.display()))
+        }
+    })?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing to {}", path.display()))?;
+    Ok(())
+}
+
 fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = from_cli {
         return Ok(p);
@@ -694,8 +751,7 @@ fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow
                 .context("writing signature to stdout")?;
         }
         SignOutput::File(sig_path) => {
-            std::fs::write(&sig_path, &sig_buf)
-                .with_context(|| format!("writing signature to {}", sig_path.display()))?;
+            write_or_refuse(&sig_path, &sig_buf, args.force)?;
             eprintln!("Signature written to {}", sig_path.display());
         }
     }
@@ -788,8 +844,7 @@ fn cmd_cert_export(
         let bytes = cert::export_binary_cert(&cert)?;
         match args.output {
             Some(path) => {
-                std::fs::write(&path, &bytes)
-                    .with_context(|| format!("writing cert to {}", path.display()))?;
+                write_or_refuse(&path, &bytes, args.force)?;
                 eprintln!("Certificate written to {}", path.display());
             }
             None => std::io::stdout().write_all(&bytes)?,
@@ -798,8 +853,7 @@ fn cmd_cert_export(
         let armored = cert::export_armored_cert(&cert)?;
         match args.output {
             Some(path) => {
-                std::fs::write(&path, &armored)
-                    .with_context(|| format!("writing cert to {}", path.display()))?;
+                write_or_refuse(&path, armored.as_bytes(), args.force)?;
                 eprintln!("Certificate written to {}", path.display());
             }
             None => print!("{armored}"),
@@ -841,7 +895,7 @@ fn cmd_cert_revoke(
     };
 
     let sig = cert::build_cert_revocation(spec)?;
-    write_revocation_output(&sig, args.binary, args.output.as_deref())
+    write_revocation_output(&sig, args.binary, args.output.as_deref(), args.force)
 }
 
 // ---------------------------------------------------------------------------
@@ -891,7 +945,7 @@ fn cmd_subkey_revoke(
     };
 
     let sig = cert::build_subkey_revocation(spec)?;
-    write_revocation_output(&sig, args.binary, args.output.as_deref())
+    write_revocation_output(&sig, args.binary, args.output.as_deref(), args.force)
 }
 
 /// Shared output handler for cert-revoke and subkey-revoke.
@@ -899,13 +953,13 @@ fn write_revocation_output(
     sig: &sequoia_openpgp::packet::Signature,
     binary: bool,
     output: Option<&std::path::Path>,
+    force: bool,
 ) -> anyhow::Result<()> {
     if binary {
         let bytes = cert::export_binary_signature(sig)?;
         match output {
             Some(path) => {
-                std::fs::write(path, &bytes)
-                    .with_context(|| format!("writing revocation to {}", path.display()))?;
+                write_or_refuse(path, &bytes, force)?;
                 eprintln!("Revocation written to {}", path.display());
             }
             None => std::io::stdout().write_all(&bytes)?,
@@ -914,8 +968,7 @@ fn write_revocation_output(
         let armored = cert::export_armored_signature(sig)?;
         match output {
             Some(path) => {
-                std::fs::write(path, &armored)
-                    .with_context(|| format!("writing revocation to {}", path.display()))?;
+                write_or_refuse(path, armored.as_bytes(), force)?;
                 eprintln!("Revocation written to {}", path.display());
             }
             None => print!("{armored}"),

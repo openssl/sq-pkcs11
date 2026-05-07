@@ -578,6 +578,94 @@ fn sign_output_dash_streams_to_stdout() {
 }
 
 #[test]
+fn sign_refuses_to_overwrite_existing_output_without_force() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let payload = tmp.path().join("p.txt");
+    let signature = tmp.path().join("p.txt.asc");
+    std::fs::write(&payload, b"payload\n").unwrap();
+    std::fs::write(&signature, b"PRECIOUS DO NOT OVERWRITE\n").unwrap();
+    let original = std::fs::read(&signature).unwrap();
+
+    // Without --force, sq-pkcs11 must fail and leave the existing file alone.
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&signature)
+        .arg(&payload)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to overwrite"),
+        "expected 'refusing to overwrite' in stderr, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&signature).unwrap(),
+        original,
+        "existing output file must be untouched after refusal"
+    );
+
+    // With --force, the same invocation succeeds and the file is overwritten.
+    sq_pkcs11(&env)
+        .args(["sign", "--force"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&signature)
+        .arg(&payload)
+        .assert()
+        .success();
+    let after = std::fs::read(&signature).unwrap();
+    assert_ne!(after, original, "--force must overwrite the file");
+    assert!(
+        String::from_utf8_lossy(&after).starts_with("-----BEGIN PGP SIGNATURE-----"),
+        "after --force the file should hold a fresh signature"
+    );
+}
+
+#[test]
+fn cert_export_refuses_to_overwrite_existing_output_without_force() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    std::fs::write(&cert_path, b"PRECIOUS PUBLISHED CERT\n").unwrap();
+    let original = std::fs::read(&cert_path).unwrap();
+
+    let assert = sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--userid", "Overwrite Test <ow@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr).contains("refusing to overwrite"),
+        "expected 'refusing to overwrite' in stderr"
+    );
+    assert_eq!(std::fs::read(&cert_path).unwrap(), original);
+
+    sq_pkcs11(&env)
+        .args(["cert-export", "--force"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--userid", "Overwrite Test <ow@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&std::fs::read(&cert_path).unwrap())
+            .starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+        "--force must overwrite the file with a fresh cert"
+    );
+}
+
+#[test]
 fn sign_binary_produces_non_armored_output() {
     let env = require_env!();
     let tmp = TempDir::new().unwrap();
