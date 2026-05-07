@@ -161,6 +161,32 @@ pub fn build_cert(spec: CertSpec<'_>) -> Result<Cert> {
                 sk.signer.public_key().mpis().clone(),
             )?);
 
+        // In merge mode, refuse to bind a subkey whose fingerprint is
+        // already present in the existing cert.  Re-running cert-export
+        // --merge-cert with the SAME --subkey-* and --subkey-creation-time
+        // is almost certainly an operator mistake (a real rotation
+        // requires a different subkey, hence different key material or
+        // a different creation time).  Silently piling on a second
+        // binding signature would canonicalise to the same packet but
+        // bloat the cert and obscure operator intent; allowing it as
+        // "idempotent" requires Sequoia's deduplication, which we
+        // shouldn't lean on for correctness.
+        if let Some(existing) = merge_into {
+            let new_fpr = subkey_key.fingerprint();
+            for existing_sub in existing.keys().subkeys() {
+                if existing_sub.key().fingerprint() == new_fpr {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "subkey {new_fpr} is already bound in the input cert; \
+                         re-running cert-export --merge-cert with the same subkey \
+                         is a no-op and almost certainly a mistake. \
+                         To rotate, supply a different --subkey-creation-time \
+                         (or a different subkey entirely) so the new subkey gets \
+                         a distinct fingerprint."
+                    )));
+                }
+            }
+        }
+
         // Cross-sig — subkey signer attests it consents to being bound.
         // Required for any signing-capable subkey to prevent subkey hijacking.
         let cross_sig = SignatureBuilder::new(SignatureType::PrimaryKeyBinding)

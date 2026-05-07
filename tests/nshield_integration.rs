@@ -2167,6 +2167,54 @@ fn wrong_creation_time_invalidates_signature_and_revocations() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn merge_cert_refuses_duplicate_subkey() {
+    // Re-running cert-export --merge-cert with the SAME subkey label
+    // and SAME --subkey-creation-time as one already bound in the
+    // input cert is almost always an operator mistake — a real
+    // rotation needs a distinct fingerprint.  Refuse loudly.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_v1 = tmp.path().join("cert-v1.asc");
+    let cert_v2 = tmp.path().join("cert-v2.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Dup Subkey <dup@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_v1)
+        .assert()
+        .success();
+
+    // Same subkey, same creation time → would produce identical
+    // fingerprint.  Must be rejected.
+    let assert = sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--merge-cert"])
+        .arg(&cert_v1)
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_v2)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("already bound") || stderr.contains("no-op"),
+        "expected duplicate-subkey rejection, got: {stderr}"
+    );
+    assert!(
+        !cert_v2.exists(),
+        "duplicate-merge must not write an output cert"
+    );
+}
+
+#[test]
 fn merge_cert_refuses_wrong_primary_creation_time() {
     let env = require_env!();
     let tmp = TempDir::new().unwrap();
