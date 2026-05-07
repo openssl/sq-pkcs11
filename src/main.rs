@@ -576,7 +576,7 @@ fn build_subkey_login<'a, A: HasSubkeyArgs>(
 /// - Anything else is delegated to `humantime` (`Nd`, `Nw`, `Nh`, `5d 12h`, ...)
 fn parse_validity(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
-    if let Some(num_str) = s.strip_suffix('y') {
+    let dur = if let Some(num_str) = s.strip_suffix('y') {
         let n: f64 = num_str
             .trim()
             .parse()
@@ -584,13 +584,23 @@ fn parse_validity(s: &str) -> anyhow::Result<std::time::Duration> {
         if !n.is_finite() || n < 0.0 {
             anyhow::bail!("--validity-period must be non-negative");
         }
-        return Ok(std::time::Duration::from_secs(
-            (n * 365.25 * 86400.0) as u64,
-        ));
+        std::time::Duration::from_secs((n * 365.25 * 86400.0) as u64)
+    } else {
+        humantime::parse_duration(s).with_context(|| {
+            format!("invalid --validity-period {s:?}; use Ny, Nw, Nd, or Nh (e.g. 5y, 60d)")
+        })?
+    };
+    // A zero-duration validity period encodes "expired the moment the
+    // signature was made" — almost certainly a fat-finger.  Operators
+    // who want an unlimited validity should use --no-expiration; we
+    // refuse to silently produce a dead-on-arrival certificate.
+    if dur.is_zero() {
+        anyhow::bail!(
+            "--validity-period {s:?} parses to zero — pass --no-expiration if you \
+             want an unlimited validity, or a positive duration like 5y or 365d"
+        );
     }
-    humantime::parse_duration(s).with_context(|| {
-        format!("invalid --validity-period {s:?}; use Ny, Nw, Nd, or Nh (e.g. 5y, 60d)")
-    })
+    Ok(dur)
 }
 
 /// Parse an optional RFC 3339 timestamp, defaulting to Unix epoch.
@@ -1273,5 +1283,18 @@ mod tests {
     #[test]
     fn validity_rejects_negative() {
         assert!(parse_validity("-3y").is_err());
+    }
+
+    #[test]
+    fn validity_rejects_zero() {
+        // Zero validity = "expired immediately".  An easy fat-finger;
+        // refuse rather than silently produce a dead-on-arrival cert.
+        for s in ["0y", "0d", "0h", "0w", "0s", "0 days"] {
+            let err = parse_validity(s).unwrap_err().to_string();
+            assert!(
+                err.contains("zero") && err.contains("--no-expiration"),
+                "expected zero-validity rejection mentioning --no-expiration for {s:?}, got: {err}"
+            );
+        }
     }
 }

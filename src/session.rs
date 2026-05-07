@@ -44,6 +44,19 @@ impl std::str::FromStr for Pkcs11Uri {
                     // RFC 7512 percent-encoding and a hex shortcut by checking
                     // for '%' itself.  Decoding here would erase that signal.
                     "id" => uri.key_id = Some(parse_id_bytes(v)?),
+                    // `type=` is part of RFC 7512.  sq-pkcs11 only operates
+                    // on private signing keys, so any explicit `type=` value
+                    // other than "private" silently contradicts what the
+                    // tool will actually look up — refuse loudly.
+                    "type" => {
+                        if v != "private" {
+                            anyhow::bail!(
+                                "PKCS#11 URI attribute type={v:?} is incompatible with sq-pkcs11; \
+                                 sq-pkcs11 always operates on private signing keys, so only \
+                                 type=private (or omitting type=) is accepted"
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -345,6 +358,35 @@ mod tests {
     fn uri_no_prefix_rejected() {
         let res: std::result::Result<Pkcs11Uri, _> = "token=foo".parse();
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn uri_type_private_accepted() {
+        let uri: Pkcs11Uri = "pkcs11:object=k;type=private".parse().unwrap();
+        assert_eq!(uri.object_label.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn uri_type_other_rejected() {
+        // sq-pkcs11 only operates on private signing keys; an explicit
+        // type= attribute that says otherwise is a silent contradiction
+        // and must be refused.
+        for bad in [
+            "pkcs11:object=k;type=public",
+            "pkcs11:object=k;type=cert",
+            "pkcs11:object=k;type=data",
+            "pkcs11:object=k;type=secret-key",
+        ] {
+            let res: std::result::Result<Pkcs11Uri, _> = bad.parse();
+            let err = res
+                .err()
+                .unwrap_or_else(|| panic!("parser must reject {bad:?}"))
+                .to_string();
+            assert!(
+                err.contains("type=") && err.contains("private"),
+                "expected error to mention type= and private for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[test]

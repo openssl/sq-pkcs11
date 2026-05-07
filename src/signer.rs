@@ -308,6 +308,7 @@ fn read_ec_public(
         ec_point.ok_or_else(|| Error::UnsupportedKeyType("EC key missing CKA_EC_POINT".into()))?;
     // CKA_EC_POINT is a DER OCTET STRING wrapping the uncompressed point.
     let point_bytes = unwrap_octet_string(&point_der)?;
+    validate_uncompressed_ec_point(&curve, &point_bytes)?;
     let q = mpi::MPI::new(&point_bytes);
 
     let key = Key4::<PublicParts, PrimaryRole>::new(
@@ -345,6 +346,60 @@ fn oid_to_curve(der: &[u8]) -> Result<Curve> {
             hex::encode(other)
         ))),
     }
+}
+
+/// Validate that `point` is a well-formed uncompressed EC point for the
+/// given NIST curve.  PKCS#11 modules generally hand back a curve-correct
+/// uncompressed point, but a buggy or hostile token could produce a
+/// compressed point (`0x02`/`0x03` prefix), the point at infinity (`0x00`),
+/// or a wrong-length blob.  Each of those would silently produce a
+/// malformed OpenPGP key whose signatures fail verification far away
+/// from the cause.  Catch them up front.
+///
+/// Uncompressed point encoding is `0x04 || X || Y` where X and Y are
+/// each `coord_size` big-endian bytes.
+fn validate_uncompressed_ec_point(curve: &Curve, point: &[u8]) -> Result<()> {
+    let coord_size = match curve {
+        Curve::NistP256 => 32,
+        Curve::NistP384 => 48,
+        Curve::NistP521 => 66,
+        other => {
+            return Err(Error::UnsupportedKeyType(format!(
+                "EC point validation: curve {other:?} is not supported"
+            )));
+        }
+    };
+    let expected_len = 1 + 2 * coord_size;
+    let first = match point.first() {
+        Some(b) => *b,
+        None => {
+            return Err(Error::UnsupportedKeyType(
+                "CKA_EC_POINT body is empty after DER OCTET STRING unwrapping".into(),
+            ));
+        }
+    };
+    if first != 0x04 {
+        // 0x02/0x03 = compressed point; 0x00 = point at infinity; anything
+        // else = malformed.  We require uncompressed because that's the
+        // form Sequoia consumes via mpi::PublicKey::ECDSA.
+        return Err(Error::UnsupportedKeyType(format!(
+            "CKA_EC_POINT must be an uncompressed point (first byte 0x04); got 0x{first:02x} \
+             ({} point or malformed)",
+            match first {
+                0x00 => "infinity",
+                0x02 | 0x03 => "compressed",
+                _ => "unknown",
+            }
+        )));
+    }
+    if point.len() != expected_len {
+        return Err(Error::UnsupportedKeyType(format!(
+            "CKA_EC_POINT length mismatch for curve {curve:?}: got {} bytes, expected {expected_len} \
+             (1 byte 0x04 prefix + 2 × {coord_size}-byte coordinate)",
+            point.len(),
+        )));
+    }
+    Ok(())
 }
 
 /// CKA_EC_POINT is DER: OCTET STRING (0x04) wrapping the raw EC point.
@@ -810,5 +865,76 @@ mod tests {
         // Curves we don't support (e.g. P-192) must not silently get a
         // default size; the function returns Err.
         assert!(expected_ecdsa_signature_len(&Curve::Cv25519).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_uncompressed_ec_point
+    // -------------------------------------------------------------------
+
+    fn ec_point(prefix: u8, len: usize) -> Vec<u8> {
+        let mut p = Vec::with_capacity(len);
+        p.push(prefix);
+        p.extend(std::iter::repeat_n(0x11u8, len.saturating_sub(1)));
+        p
+    }
+
+    #[test]
+    fn ec_point_accepts_well_formed_p256_p384_p521() {
+        // P-256: 0x04 + 32 + 32 = 65 bytes
+        validate_uncompressed_ec_point(&Curve::NistP256, &ec_point(0x04, 65)).unwrap();
+        // P-384: 0x04 + 48 + 48 = 97
+        validate_uncompressed_ec_point(&Curve::NistP384, &ec_point(0x04, 97)).unwrap();
+        // P-521: 0x04 + 66 + 66 = 133
+        validate_uncompressed_ec_point(&Curve::NistP521, &ec_point(0x04, 133)).unwrap();
+    }
+
+    #[test]
+    fn ec_point_rejects_compressed_prefix() {
+        for prefix in [0x02u8, 0x03] {
+            let err = validate_uncompressed_ec_point(&Curve::NistP384, &ec_point(prefix, 97))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("uncompressed") && err.contains("compressed"),
+                "expected message naming compressed encoding for prefix {prefix:#04x}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ec_point_rejects_point_at_infinity() {
+        let err = validate_uncompressed_ec_point(&Curve::NistP256, &ec_point(0x00, 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("infinity"), "got: {err}");
+    }
+
+    #[test]
+    fn ec_point_rejects_unknown_prefix() {
+        let err = validate_uncompressed_ec_point(&Curve::NistP256, &ec_point(0x05, 65))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown") || err.contains("0x05"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ec_point_rejects_wrong_length() {
+        // P-256 expects 65 bytes; pass 97 (P-384 length).  Catches
+        // mismatched curve / point pairings.
+        let err = validate_uncompressed_ec_point(&Curve::NistP256, &ec_point(0x04, 97))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("expected 65") && err.contains("97"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ec_point_rejects_empty() {
+        assert!(validate_uncompressed_ec_point(&Curve::NistP256, &[]).is_err());
     }
 }
