@@ -1402,6 +1402,175 @@ fn subkey_revoke_rejects_malformed_inputs() {
     assert!(!revocation.exists());
 }
 
+// ---------------------------------------------------------------------------
+// verify-signing-key: pre-flight check that the configured HSM key really is a
+// current valid signer of the published cert.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_signing_key_accepts_current_signing_subkey() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Verify Signing <vs@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    // The configured signing subkey IS the cert's current signing
+    // subkey — verification must succeed.
+    let assert = sq_pkcs11(&env)
+        .args(["verify-signing-key"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout).contains("is a current signing key"),
+        "expected success message"
+    );
+}
+
+#[test]
+fn verify_signing_key_rejects_unrelated_hsm_key() {
+    // Operator points at a different HSM key (env.rsa_label) than the
+    // one bound in the cert (env.subkey_label).  Verification must
+    // fail with "not bound to <cert>" — catches the typo'd
+    // OPENSSL_PGP_CURRENT_SUBKEY_LABEL case Codex flagged.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Stale Signer <ss@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    let assert = sq_pkcs11(&env)
+        .args(["verify-signing-key"])
+        .args(["--key-label", &env.rsa_label]) // ← wrong key
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("not bound to"),
+        "expected 'not bound to ...' for an unrelated HSM key, got: {stderr}"
+    );
+}
+
+#[test]
+fn verify_signing_key_rejects_certify_only_primary() {
+    // In a two-tier cert, the primary carries the certification flag
+    // only; it is NOT signing-capable.  Verifying the primary as a
+    // signing key must therefore fail because no candidate matches the
+    // signing-flag filter.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Two Tier <2t@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    let assert = sq_pkcs11(&env)
+        .args(["verify-signing-key"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("present in") && stderr.contains("not currently a valid signer"),
+        "expected 'present but not valid signer' for the certify-only primary, got: {stderr}"
+    );
+}
+
+#[test]
+fn verify_signing_key_rejects_revoked_subkey() {
+    // Revoke the subkey, merge the revocation into the cert, then run
+    // verify-signing-key against the merged cert: the previously-valid
+    // signing subkey must now be reported as not currently valid.
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert = tmp.path().join("cert.asc");
+    let revocation = tmp.path().join("rev.asc");
+    let merged_cert = tmp.path().join("cert-with-revocation.asc");
+
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "Revoked Signer <rs@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert)
+        .assert()
+        .success();
+
+    let subkey_fpr = subkey_fingerprint_hex(&cert);
+    sq_pkcs11(&env)
+        .args(["subkey-revoke"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--input-cert"])
+        .arg(&cert)
+        .args(["--subkey-fingerprint", &subkey_fpr])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--reason", "compromised"])
+        .args(["--output"])
+        .arg(&revocation)
+        .assert()
+        .success();
+
+    let cert_bytes = std::fs::read(&cert).unwrap();
+    let rev_bytes = std::fs::read(&revocation).unwrap();
+    std::fs::write(&merged_cert, [&cert_bytes[..], &rev_bytes[..]].concat()).unwrap();
+
+    let assert = sq_pkcs11(&env)
+        .args(["verify-signing-key"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--input-cert"])
+        .arg(&merged_cert)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("not currently a valid signer"),
+        "expected 'not currently a valid signer' after revocation, got: {stderr}"
+    );
+}
+
 #[test]
 fn subkey_revoke_works_without_subkey_hsm_access() {
     // The whole point of the subkey-revoke API redesign: a compromised

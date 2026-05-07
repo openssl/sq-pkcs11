@@ -45,6 +45,10 @@ enum Command {
     SubkeyRevoke(SubkeyRevokeArgs),
     /// List signing keys visible in the PKCS#11 token.
     ListKeys(ListKeysArgs),
+    /// Verify that an HSM key is a currently-valid signer in a given
+    /// certificate.  Pre-flight check against using a stale, revoked,
+    /// expired, or unrelated HSM key for production signing.
+    VerifySigningKey(VerifySigningKeyArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +481,34 @@ struct ListKeysArgs {
 }
 
 // ---------------------------------------------------------------------------
+// verify-signing-key
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args)]
+struct VerifySigningKeyArgs {
+    #[command(flatten)]
+    key: KeySelectionArgs,
+
+    #[command(flatten)]
+    auth: AuthArgs,
+
+    /// Key creation time (RFC 3339) used to derive the OpenPGP fingerprint
+    /// of the HSM key — same semantics as in cert-export and sign.
+    #[arg(long, value_name = "TIMESTAMP")]
+    creation_time: Option<String>,
+
+    /// Path to the published certificate the HSM key must belong to.
+    #[arg(long, value_name = "FILE")]
+    input_cert: PathBuf,
+
+    /// Reference time for the cert's policy / liveness checks
+    /// (must-not-be-revoked, must-not-be-expired-at-this-time).
+    /// Defaults to the current system time.
+    #[arg(long, value_name = "TIMESTAMP")]
+    at_time: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -494,6 +526,7 @@ fn main() -> anyhow::Result<()> {
         Command::CertRevoke(args) => cmd_cert_revoke(&pkcs11, &module, args),
         Command::SubkeyRevoke(args) => cmd_subkey_revoke(&pkcs11, &module, args),
         Command::ListKeys(args) => cmd_list_keys(&pkcs11, args),
+        Command::VerifySigningKey(args) => cmd_verify_signing_key(&pkcs11, &module, args),
     }
 }
 
@@ -1079,6 +1112,115 @@ fn write_revocation_output(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verify-signing-key
+// ---------------------------------------------------------------------------
+
+fn cmd_verify_signing_key(
+    pkcs11: &Pkcs11,
+    module: &std::path::Path,
+    args: VerifySigningKeyArgs,
+) -> anyhow::Result<()> {
+    use sequoia_openpgp::policy::StandardPolicy;
+    use sequoia_openpgp::types::KeyFlags;
+
+    let selector = args.key.resolve()?;
+    let login = args.auth.login_mode(module)?;
+    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let at_time = match args.at_time.as_deref() {
+        Some(s) => parse_creation_time(Some(s))?,
+        None => std::time::SystemTime::now(),
+    };
+
+    // Parse the cert before any HSM round-trip so a malformed cert
+    // input fails immediately rather than after using a session.
+    let cert_bytes = std::fs::read(&args.input_cert)
+        .with_context(|| format!("reading --input-cert {}", args.input_cert.display()))?;
+    let cert = cert::parse_cert(&cert_bytes)?;
+
+    // Open the HSM session, read the public material, stamp it with
+    // the declared creation time so its fingerprint matches what the
+    // cert would carry.
+    let (session, _) = session::open_session(pkcs11, &selector, &login)?;
+    let priv_handle = session::resolve_single_key(&session, &selector)?;
+    let mut signer = Pkcs11Signer::new(session, priv_handle)?;
+    signer.set_creation_time(creation_time)?;
+
+    let hsm_key = sequoia_openpgp::packet::Key::V4(sequoia_openpgp::packet::key::Key4::<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::PrimaryRole,
+    >::new(
+        creation_time,
+        signer.public_key().pk_algo(),
+        signer.public_key().mpis().clone(),
+    )?);
+    let hsm_fpr = hsm_key.fingerprint();
+
+    // Apply Sequoia's StandardPolicy at the chosen reference time.
+    // ValidCert::keys() yields keys whose binding signatures are valid
+    // under that policy at that time.  Filtering on .alive() rejects
+    // expired keys; .revoked(false) rejects revoked keys; key_flags()
+    // restricts to signing-capable.
+    //
+    // We accept BOTH the primary and any subkey as a valid match: a
+    // single-tier cert (no subkeys, primary carries the signing flag)
+    // is a reasonable deployment that we shouldn't reject here.  Any
+    // policy that requires a specific structure (e.g. "release artefacts
+    // must be signed by a subkey, never the primary") belongs in the
+    // operator's wrapper, not in this generic primitive.
+    let policy = StandardPolicy::new();
+    let valid = cert.with_policy(&policy, at_time).with_context(|| {
+        format!(
+            "input cert {} fails StandardPolicy validation at {}",
+            args.input_cert.display(),
+            humantime::format_rfc3339(at_time),
+        )
+    })?;
+
+    let signing_flag = KeyFlags::empty().set_signing();
+    let candidates: Vec<_> = valid
+        .keys()
+        .alive()
+        .revoked(false)
+        .key_flags(signing_flag)
+        .collect();
+
+    if candidates.iter().any(|k| k.key().fingerprint() == hsm_fpr) {
+        println!(
+            "OK: HSM key {hsm_fpr} is a current signing key in {}",
+            args.input_cert.display()
+        );
+        return Ok(());
+    }
+
+    // No match.  Distinguish "key isn't bound at all" (operator picked
+    // the wrong --key-label / --creation-time, or the wrong cert) from
+    // "key is bound but isn't currently a valid signer" (revoked,
+    // expired, or signing flag missing).  Different operator fixes.
+    let bound_at_all = cert.keys().any(|k| k.key().fingerprint() == hsm_fpr);
+    if bound_at_all {
+        anyhow::bail!(
+            "HSM key {hsm_fpr} is present in {} but is not currently a valid signer \
+             at {} (revoked, expired, or not signing-capable); \
+             current valid signing keys: [{}]",
+            args.input_cert.display(),
+            humantime::format_rfc3339(at_time),
+            candidates
+                .iter()
+                .map(|k| k.key().fingerprint().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    } else {
+        anyhow::bail!(
+            "HSM key {hsm_fpr} is not bound to {} at all; \
+             either --key-label / --creation-time disagree with the cert, \
+             or the wrong cert was supplied",
+            args.input_cert.display(),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
