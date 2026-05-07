@@ -721,10 +721,20 @@ fn subkey_revoke_marks_only_subkey_revoked() {
         .assert()
         .success();
 
-    gpg_in(&home).arg("--import").arg(&cert).assert_success();
+    // GnuPG will silently drop a standalone subkey-revocation file
+    // imported on its own (`Total number processed: 0`); it only attaches
+    // the revocation to the matching subkey when the revocation arrives
+    // *together with* the cert in a single import stream.  Concatenate
+    // the binary forms of the cert and the revocation into one combined
+    // file and import that — the same workaround real consumers must
+    // apply.
+    let combined = tmp.path().join("cert-with-subkey-revocation.asc");
+    let cert_bytes = std::fs::read(&cert).unwrap();
+    let rev_bytes = std::fs::read(&revocation).unwrap();
+    std::fs::write(&combined, [&cert_bytes[..], &rev_bytes[..]].concat()).unwrap();
     gpg_in(&home)
         .arg("--import")
-        .arg(&revocation)
+        .arg(&combined)
         .assert_success();
 
     let listing = gpg_in(&home)
@@ -797,7 +807,14 @@ fn merge_cert_preserves_old_subkey() {
 
     // 3. Merge — same primary creation time, new subkey, distinct subkey
     //    creation time so the new subkey has its own fingerprint.
-    let new_subkey_time = "2026-06-01T00:00:00Z";
+    // Pick a creation time DIFFERENT from STABLE_TIME (so the old and new
+    // subkeys have distinct fingerprints) but firmly in the past.  An
+    // earlier draft used "2026-06-01T00:00:00Z", which fails once the
+    // wall clock reaches a date earlier than that — gpg refuses signatures
+    // made before the signing key claims to have been created ("public
+    // key … is N days newer than the signature").  STABLE_TIME + a few
+    // hours is past, distinct, and stable.
+    let new_subkey_time = "2026-01-01T06:00:00Z";
     sq_pkcs11(&env)
         .args(["cert-export"])
         .args(["--merge-cert"])
