@@ -1,23 +1,28 @@
-// Emit VERGEN_GIT_DESCRIBE — "v0.1.0-3-gabc1234" plus "-modified" when the
-// working tree is dirty — for `--version` to embed at compile time.
+// Emit GIT_DESCRIBE — "v0.1.0-3-gabc1234" plus "-modified" when the working
+// tree is dirty — for `src/main.rs` to concatenate into the `--version`
+// string via env!().  Falls back to "unknown" when there's no .git
+// (source-tarball builds), so the binary still builds.
 //
-// `.idempotent()` makes vergen emit a placeholder rather than failing when
-// .git is absent (e.g. building from a source tarball), so the binary still
-// builds.  In that case `--version` will show "VERGEN_IDEMPOTENT_OUTPUT".
+// Implemented directly via `git` rather than a vergen-style crate to avoid
+// pulling in a build-deps subtree that would track ahead of our MSRV.
 
-use vergen_gitcl::{Emitter, GitclBuilder};
+use std::process::Command;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let git = GitclBuilder::default()
-        .describe(
-            /* tags */ true, /* dirty */ true, /* match */ None,
-        )
-        .build()?;
+fn main() {
+    // Re-run when HEAD moves or a tag is created/removed.  This is a
+    // best-effort heuristic — it misses dirty-tree transitions, but the
+    // dirty marker is cosmetic for --version output, not load-bearing.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
 
-    Emitter::default()
-        .idempotent()
-        .add_instructions(&git)?
-        .emit()?;
+    let describe = Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty=-modified"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
-    Ok(())
+    println!("cargo:rustc-env=GIT_DESCRIBE={describe}");
 }
