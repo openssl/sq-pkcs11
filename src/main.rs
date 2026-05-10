@@ -267,7 +267,10 @@ struct CertExportArgs {
     ///
     /// Format: integer + unit (y = years, w = weeks, d = days, h = hours).
     /// Examples: "5y", "730d", "260w".  Defaults to 5 years.
-    /// Years use the calendar approximation 1y = 365.25 days.
+    ///
+    /// `Ny` is calendar-aware: `5y` from 2026-05-10T19:53:26Z expires at
+    /// 2031-05-10T19:53:26Z exactly.  Feb 29 falls back to Feb 28 in
+    /// non-leap target years.  Other units are exact durations.
     ///
     /// Re-issue the certificate before expiry to extend it.
     #[arg(
@@ -609,22 +612,54 @@ fn build_subkey_login<'a, A: HasSubkeyArgs>(
     Ok(LoginMode::None)
 }
 
-/// Parse a validity-period string into a `Duration`.
+/// Return the `Duration` from `creation` to its calendar anniversary `n`
+/// years later, with Feb 29 → Feb 28 fallback in non-leap target years.
+fn years_from(creation: std::time::SystemTime, n: u32) -> anyhow::Result<std::time::Duration> {
+    use chrono::{DateTime, Datelike, Utc};
+    let secs = creation
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("creation time is before the Unix epoch"))?
+        .as_secs() as i64;
+    let creation_dt = DateTime::<Utc>::from_timestamp(secs, 0)
+        .ok_or_else(|| anyhow::anyhow!("creation time is out of the representable range"))?;
+    let new_year = creation_dt
+        .year()
+        .checked_add(n as i32)
+        .ok_or_else(|| anyhow::anyhow!("year arithmetic overflowed ({n}y past creation)"))?;
+    let expiration_dt = creation_dt.with_year(new_year).or_else(|| {
+        // Feb 29 + N years where (year + N) is not a leap year: fall back to Feb 28.
+        creation_dt.with_day(28).and_then(|d| d.with_year(new_year))
+    });
+    let expiration_dt =
+        expiration_dt.ok_or_else(|| anyhow::anyhow!("year arithmetic produced an invalid date"))?;
+    let delta = (expiration_dt.timestamp() - creation_dt.timestamp()) as u64;
+    Ok(std::time::Duration::from_secs(delta))
+}
+
+/// Parse a validity-period string into a `Duration` relative to `creation`.
 ///
 /// Accepts:
-/// - `Ny` for years (1y = 365.25 days, calendar-approximate)
-/// - Anything else is delegated to `humantime` (`Nd`, `Nw`, `Nh`, `5d 12h`, ...)
-fn parse_validity(s: &str) -> anyhow::Result<std::time::Duration> {
+/// - `Ny` for years (integer N) — calendar-aware: lands on the same
+///   wall-clock time of the same calendar date N years after `creation`.
+///   Feb 29 falls back to Feb 28 in non-leap target years.
+/// - Anything else is delegated to `humantime` (`Nd`, `Nw`, `Nh`, `5d 12h`, …)
+///   and treated as an exact fixed duration.
+///
+/// The Ny branch needs `creation` because the calendar distance between
+/// "now" and "N years from now" depends on which leap years fall in the
+/// span.  The old `1y = 365.25 days` Julian-year approximation drifted
+/// 6h/year off the wall-clock anniversary; the calendar form removes
+/// that.
+fn parse_validity(s: &str, creation: std::time::SystemTime) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
     let dur = if let Some(num_str) = s.strip_suffix('y') {
-        let n: f64 = num_str
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid years value in --validity-period {s:?}"))?;
-        if !n.is_finite() || n < 0.0 {
-            anyhow::bail!("--validity-period must be non-negative");
-        }
-        std::time::Duration::from_secs((n * 365.25 * 86400.0) as u64)
+        let n: u32 = num_str.trim().parse().with_context(|| {
+            format!(
+                "invalid years value in --validity-period {s:?}: \
+                 expected a non-negative integer (e.g. 5y, 10y)"
+            )
+        })?;
+        years_from(creation, n).with_context(|| format!("--validity-period {s:?}"))?
     } else {
         humantime::parse_duration(s).with_context(|| {
             format!("invalid --validity-period {s:?}; use Ny, Nw, Nd, or Nh (e.g. 5y, 60d)")
@@ -847,7 +882,10 @@ fn cmd_cert_export(
     let primary_validity = if args.no_expiration {
         None
     } else {
-        Some(parse_validity(&args.validity_period)?)
+        Some(parse_validity(
+            &args.validity_period,
+            primary_creation_time,
+        )?)
     };
 
     let (primary_session, _) = session::open_session(pkcs11, &primary_selector, &primary_login)?;
@@ -866,7 +904,10 @@ fn cmd_cert_export(
         subkey_validity = if args.subkey_no_expiration {
             None
         } else {
-            Some(parse_validity(&args.subkey_validity_period)?)
+            Some(parse_validity(
+                &args.subkey_validity_period,
+                subkey_creation_time,
+            )?)
         };
         let (sk_session, _) = session::open_session(pkcs11, sel, &subkey_login)?;
         let sk_handle = session::resolve_single_key(&sk_session, sel)?;
@@ -1400,46 +1441,81 @@ mod tests {
     }
 
     #[test]
-    fn validity_years_uses_calendar_approximation() {
-        // 1y = 365.25 * 86400 = 31,557,600 s
-        let d = parse_validity("1y").unwrap();
-        assert_eq!(d.as_secs(), 31_557_600);
-        // 5y = 5 * 31,557,600
-        assert_eq!(parse_validity("5y").unwrap().as_secs(), 157_788_000);
+    fn validity_years_lands_on_calendar_anniversary() {
+        // 5y from 2026-05-10T19:53:26Z must land at 2031-05-10T19:53:26Z
+        // exactly — no 6h drift from the old Julian-year approximation.
+        let creation = humantime::parse_rfc3339("2026-05-10T19:53:26Z").unwrap();
+        let d = parse_validity("5y", creation).unwrap();
+        let expiration = creation + d;
+        let expected = humantime::parse_rfc3339("2031-05-10T19:53:26Z").unwrap();
+        assert_eq!(expiration, expected);
+    }
+
+    #[test]
+    fn validity_years_leap_count_changes_with_creation_date() {
+        // 1y starting *before* Feb 29 of a leap year spans 366 days;
+        // 1y starting *after* it spans 365.  The calendar form reflects
+        // this asymmetry; the old fixed-365.25-day form did not.
+        let before = humantime::parse_rfc3339("2024-02-15T12:00:00Z").unwrap();
+        let after = humantime::parse_rfc3339("2024-03-01T12:00:00Z").unwrap();
+        assert_eq!(
+            parse_validity("1y", before).unwrap().as_secs(),
+            366 * 86_400
+        );
+        assert_eq!(parse_validity("1y", after).unwrap().as_secs(), 365 * 86_400);
+    }
+
+    #[test]
+    fn validity_years_feb29_falls_back_to_feb28() {
+        // Creation on Feb 29 of a leap year + 1y lands on Feb 28 of the
+        // following (non-leap) year.
+        let creation = humantime::parse_rfc3339("2024-02-29T12:00:00Z").unwrap();
+        let d = parse_validity("1y", creation).unwrap();
+        let expiration = creation + d;
+        let expected = humantime::parse_rfc3339("2025-02-28T12:00:00Z").unwrap();
+        assert_eq!(expiration, expected);
     }
 
     #[test]
     fn validity_humantime_units() {
-        // Days, weeks, hours go through humantime.
-        assert_eq!(parse_validity("30d").unwrap().as_secs(), 30 * 86_400);
-        assert_eq!(parse_validity("1w").unwrap().as_secs(), 7 * 86_400);
-        assert_eq!(parse_validity("48h").unwrap().as_secs(), 48 * 3_600);
+        // Days, weeks, hours go through humantime — not creation-dependent.
+        let c = std::time::SystemTime::UNIX_EPOCH;
+        assert_eq!(parse_validity("30d", c).unwrap().as_secs(), 30 * 86_400);
+        assert_eq!(parse_validity("1w", c).unwrap().as_secs(), 7 * 86_400);
+        assert_eq!(parse_validity("48h", c).unwrap().as_secs(), 48 * 3_600);
     }
 
     #[test]
     fn validity_default_is_5_years() {
-        // The clap default value used in the CLI must parse cleanly.
-        assert_eq!(parse_validity("5y").unwrap().as_secs(), 157_788_000);
+        // The clap default value "5y" must parse cleanly.
+        let c = humantime::parse_rfc3339("2026-05-10T19:53:26Z").unwrap();
+        assert!(parse_validity("5y", c).is_ok());
     }
 
     #[test]
     fn validity_rejects_garbage() {
-        assert!(parse_validity("forever").is_err());
-        assert!(parse_validity("").is_err());
-        assert!(parse_validity("xy").is_err());
+        let c = std::time::SystemTime::UNIX_EPOCH;
+        assert!(parse_validity("forever", c).is_err());
+        assert!(parse_validity("", c).is_err());
+        assert!(parse_validity("xy", c).is_err());
+        // Fractional years are no longer accepted — calendar arithmetic
+        // is defined on whole years only.
+        assert!(parse_validity("1.5y", c).is_err());
     }
 
     #[test]
     fn validity_rejects_negative() {
-        assert!(parse_validity("-3y").is_err());
+        let c = std::time::SystemTime::UNIX_EPOCH;
+        assert!(parse_validity("-3y", c).is_err());
     }
 
     #[test]
     fn validity_rejects_zero() {
         // Zero validity = "expired immediately".  An easy fat-finger;
         // refuse rather than silently produce a dead-on-arrival cert.
+        let c = std::time::SystemTime::UNIX_EPOCH;
         for s in ["0y", "0d", "0h", "0w", "0s", "0 days"] {
-            let err = parse_validity(s).unwrap_err().to_string();
+            let err = parse_validity(s, c).unwrap_err().to_string();
             assert!(
                 err.contains("zero") && err.contains("--no-expiration"),
                 "expected zero-validity rejection mentioning --no-expiration for {s:?}, got: {err}"

@@ -2102,7 +2102,10 @@ fn validity_periods_are_recorded_in_signatures() {
         .expect("primary key_validity_period subpacket present");
     let ten_years = Duration::from_secs((10.0 * 365.25 * 86_400.0) as u64);
     let one_year = Duration::from_secs((365.25 * 86_400.0) as u64);
-    // 1-day tolerance covers any rounding inside the years→seconds conversion.
+    // 1-day tolerance covers leap-year variability in the calendar-aware
+    // year arithmetic done by parse_validity — the actual duration depends
+    // on how many Feb 29s fall in the span, which the Julian-year baseline
+    // above doesn't capture.
     let tolerance = Duration::from_secs(86_400);
     assert!(
         primary_validity.abs_diff(ten_years) <= tolerance,

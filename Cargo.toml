@@ -39,6 +39,13 @@ hex = "0.4"
 # RFC 3339 / ISO 8601 timestamp parsing for --creation-time
 humantime = "2"
 
+# Calendar-aware year arithmetic for --validity-period `Ny`.  Without this,
+# the 365.25-day Julian-year approximation drifts ~6h/year off the wall-clock
+# anniversary of the creation timestamp — annoying for audit-trail clarity
+# on multi-year release-signing certs.  Only `std` is enabled; we don't need
+# clock/now or the IANA timezone database.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 # Direct symbol loading for nShield extension functions (C_LoginBegin/Next/End)
 libloading = "0.8"
 

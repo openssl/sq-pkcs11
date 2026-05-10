@@ -176,11 +176,16 @@ sub   rsa4096 2026-05-01 [S] [expires: 2028-05-01]
 ```
 
 `--validity-period` defaults to **5 years**. Format: integer + unit
-(`y` years, `w` weeks, `d` days, `h` hours). Years use the calendar
-approximation `1y = 365.25d`. To issue a non-expiring certificate, pass
-`--no-expiration` instead — but prefer a finite period as defence in
-depth: an expired key cannot make new signatures, but old signatures
-made while the key was valid keep verifying indefinitely.
+(`y` years, `w` weeks, `d` days, `h` hours). `Ny` is **calendar-aware**:
+`--validity-period 5y --creation-time 2026-05-10T19:53:26Z` expires at
+`2031-05-10T19:53:26Z` exactly, regardless of how many leap years fall
+in between (Feb 29 falls back to Feb 28 in non-leap target years).
+Other units are exact fixed durations.
+
+To issue a non-expiring certificate, pass `--no-expiration` instead —
+but prefer a finite period as defence in depth: an expired key cannot
+make new signatures, but old signatures made while the key was valid
+keep verifying indefinitely.
 
 To extend a key beyond its expiry, re-run `cert-export` with the same
 `--creation-time` and a longer `--validity-period`, then redistribute
