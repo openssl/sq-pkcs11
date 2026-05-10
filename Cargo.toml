@@ -42,6 +42,12 @@ humantime = "2"
 # Direct symbol loading for nShield extension functions (C_LoginBegin/Next/End)
 libloading = "0.8"
 
+[build-dependencies]
+# Embed `git describe` output at compile time so `sq-pkcs11 --version`
+# reports the actual git state independent of the Cargo.toml `version`
+# field above.  See build.rs.
+vergen-gitcl = "1"
+
 [dev-dependencies]
 # CLI integration test scaffolding
 assert_cmd = "2"

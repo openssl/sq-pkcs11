@@ -1,0 +1,49 @@
+# cargo-release configuration.
+#
+# Typical use:
+#   cargo release patch --execute     # 0.1.0 -> 0.1.1
+#   cargo release minor --execute     # 0.1.x -> 0.2.0
+#   cargo release major --execute     # 0.x.y -> 1.0.0
+#   cargo release 0.3.0 --execute     # set an explicit version
+#
+# What it does on `--execute`:
+#   1. Edits Cargo.toml `version`, regenerates Cargo.lock.
+#   2. Creates a "Release vX.Y.Z" commit.
+#   3. Creates an annotated, signed git tag vX.Y.Z.
+#   4. Pushes the commit and tag to `origin`.
+#
+# Without `--execute` it dry-runs and prints what it would do.
+
+# This crate is a binary, not a library; we don't publish to crates.io.
+# The signed git tag is the artifact of record.
+publish = false
+
+# Refuse to release from anywhere other than `main`.  Stops accidental
+# releases from a topic branch.
+allow-branch = ["main"]
+
+# Tag format: `v0.3.0`.  Matches the GitHub Releases convention and lets
+# downstream Jenkinsfiles pin via `git fetch && git checkout v0.3.0`.
+tag-name = "v{{version}}"
+tag-message = "sq-pkcs11 {{version}}"
+
+# Sign the release tag.  Operator prerequisite: git is configured with
+# `gpg.program=…/tools/release-tools/sq-pkcs11-git-shim` and the HSM-backed
+# signing key is reachable (OCS quorum must be presented interactively).
+# Flip to `false` for unsigned dev releases.
+sign-tag = false
+
+# Don't sign the bump commit itself — only the tag.  The tag is the auditable
+# artifact; signing every "Release vX.Y.Z" commit is operational noise.
+sign-commit = false
+
+# Push the bump commit and the tag in one go.  Set to `false` if you prefer
+# to inspect locally first and push manually.
+push = false
+
+# Run the full test suite before bumping.  cargo-release aborts if this
+# fails, so a broken tree never produces a tag.
+# (Working-tree cleanliness is checked by default; no config knob needed —
+# cargo-release will refuse to proceed with uncommitted changes unless you
+# pass `--allow-dirty` on the command line.)
+pre-release-hook = ["cargo", "test", "--release"]

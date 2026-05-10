@@ -17,9 +17,20 @@ use sequoia_openpgp::{
 use session::{KeySelector, LoginMode, Pkcs11Uri};
 use signer::Pkcs11Signer;
 
+/// `"x.y.z (vX.Y.Z-N-gSHA[-modified])"` — Cargo.toml version plus a `git
+/// describe` suffix.  Lets a deployed binary be traced to an exact commit
+/// even when the manifest version hasn't been bumped yet.  vergen handles
+/// the no-`.git` fallback (source-tarball builds) by emitting a placeholder.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("VERGEN_GIT_DESCRIBE"),
+    ")"
+);
+
 /// OpenPGP signing tool backed by a PKCS#11 HSM.
 #[derive(Parser)]
-#[command(name = "sq-pkcs11", version)]
+#[command(name = "sq-pkcs11", version = VERSION)]
 struct Cli {
     /// Path to the PKCS#11 shared library (vendor module).
     ///
