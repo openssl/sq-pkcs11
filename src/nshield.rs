@@ -142,19 +142,48 @@ fn ck_ok(rv: CK_RV, call: &str) -> Result<()> {
     if rv == 0 {
         return Ok(());
     }
+    // PKCS#11 v2.40 CK_RV codes.  An earlier draft of this table had the
+    // PIN-related codes at 0x30 (which is actually CKR_DEVICE_ERROR) and
+    // CKR_USER_* mislabelled as CKR_SESSION_*; corrected here against the
+    // OASIS standard.  Reference: oasis-open.org/standards#pkcs11-base-v2.40.
     let msg = match rv {
         0x0000_0001 => "CKR_CANCEL",
         0x0000_0002 => "CKR_HOST_MEMORY",
         0x0000_0003 => "CKR_SLOT_ID_INVALID",
         0x0000_0005 => "CKR_GENERAL_ERROR",
         0x0000_0006 => "CKR_FUNCTION_FAILED",
-        0x0000_0030 => "CKR_PIN_INCORRECT",
-        0x0000_0031 => "CKR_PIN_INVALID",
-        0x0000_0032 => "CKR_PIN_LEN_RANGE",
-        0x0000_0100 => "CKR_SESSION_HANDLE_INVALID",
-        0x0000_0101 => "CKR_SESSION_PARALLEL_NOT_SUPPORTED",
+        0x0000_0007 => "CKR_ARGUMENTS_BAD",
+        0x0000_0030 => "CKR_DEVICE_ERROR",
+        0x0000_0031 => "CKR_DEVICE_MEMORY",
+        0x0000_0032 => "CKR_DEVICE_REMOVED",
+        0x0000_0050 => "CKR_FUNCTION_CANCELED",
+        0x0000_0054 => "CKR_FUNCTION_NOT_SUPPORTED",
+        0x0000_0090 => "CKR_OPERATION_ACTIVE",
+        0x0000_0091 => "CKR_OPERATION_NOT_INITIALIZED",
+        0x0000_00A0 => {
+            "CKR_PIN_INCORRECT — passphrase did not match the card's share \
+                        (check keyboard layout / Caps Lock; this iteration may need to be \
+                        retried — some nShield builds invalidate the quorum on a wrong PIN \
+                        and require restarting C_LoginBegin)"
+        }
+        0x0000_00A1 => "CKR_PIN_INVALID",
+        0x0000_00A2 => "CKR_PIN_LEN_RANGE",
+        0x0000_00A3 => "CKR_PIN_EXPIRED",
+        0x0000_00A4 => {
+            "CKR_PIN_LOCKED — the card has been frozen after too many wrong \
+                        passphrase attempts; unlocking is an ACS-quorum admin operation"
+        }
+        0x0000_00B0 => "CKR_SESSION_CLOSED",
+        0x0000_00B3 => "CKR_SESSION_HANDLE_INVALID",
+        0x0000_00B4 => "CKR_SESSION_PARALLEL_NOT_SUPPORTED",
         0x0000_00E0 => "CKR_TOKEN_NOT_PRESENT",
         0x0000_00E1 => "CKR_TOKEN_NOT_RECOGNIZED",
+        0x0000_0100 => "CKR_USER_ALREADY_LOGGED_IN",
+        0x0000_0101 => "CKR_USER_NOT_LOGGED_IN",
+        0x0000_0102 => "CKR_USER_PIN_NOT_INITIALIZED",
+        0x0000_0103 => "CKR_USER_TYPE_INVALID",
+        0x0000_0104 => "CKR_USER_ANOTHER_ALREADY_LOGGED_IN",
+        0x0000_0105 => "CKR_USER_TOO_MANY_TYPES",
         0x8000_0001 => "CKR_FIPS_TOKEN_NOT_PRESENT (nShield)",
         0x8000_0002 => "CKR_FIPS_MECHANISM_INVALID (nShield)",
         0x8000_0003 => "CKR_FIPS_FUNCTION_NOT_SUPPORTED (nShield)",
