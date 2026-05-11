@@ -1286,6 +1286,12 @@ fn cmd_list_keys(pkcs11: &Pkcs11, args: ListKeysArgs) -> anyhow::Result<()> {
 
         if let Some(p) = &pin {
             let _ = session.login(UserType::User, Some(&AuthPin::from(p.clone())));
+        } else if info.login_required() {
+            // No PIN provided but the slot requires login.  Try a NULL-PIN
+            // C_Login to pick up a credential preloaded by an external
+            // tool (e.g. nShield's `preload`).  Best-effort — if it
+            // fails the slot just shows "(no signing keys)" as before.
+            let _ = session.login(UserType::User, None);
         }
 
         let handles = session.find_objects(&[

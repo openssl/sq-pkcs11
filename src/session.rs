@@ -175,7 +175,30 @@ pub fn open_session(
     let session = pkcs11.open_ro_session(slot)?;
 
     match login_mode {
-        LoginMode::None => {}
+        // Module-protected slots need no login.  Token-protected slots
+        // (OCS, softcard) still require C_Login even when an external
+        // tool like nShield's `preload` has already cached the
+        // credential — without the call the PKCS#11 session stays in
+        // the Public state and private signing keys remain invisible.
+        // Pass a NULL PIN, the PKCS#11 idiom for "use the protected
+        // authentication path / preloaded credential".
+        LoginMode::None => {
+            let needs_login = pkcs11
+                .get_token_info(slot)
+                .map(|i| i.login_required())
+                .unwrap_or(false);
+            if needs_login {
+                use anyhow::Context;
+                session
+                    .login(UserType::User, None)
+                    .map_err(anyhow::Error::from)
+                    .context(
+                        "token-protected slot needs C_Login but no PIN was supplied; \
+                         pass --pin-file for a softcard or single-card OCS, or run \
+                         sq-pkcs11 under nShield's `preload` for a K/N OCS quorum",
+                    )?;
+            }
+        }
 
         LoginMode::Pin(pin) => {
             session.login(UserType::User, Some(&AuthPin::from(pin.clone())))?;
