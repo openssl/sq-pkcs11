@@ -7,10 +7,10 @@ Built primarily for the OpenSSL release-signing workflow on Entrust nShield
 HSMs in FIPS 140-3 mode, but the standard subcommands work with any
 PKCS#11 v2.40+ module that supports the algorithms listed below.
 
-For nShield-specific operational notes — the OCS quorum login extension,
-vendor `CKA_NFKM_*` attributes, recipes for reading the Security World
-key-generation timestamp, and FIPS 140-3 algorithm constraints — see
-[`NSHIELD.md`](NSHIELD.md).
+For nShield-specific operational notes — running K/N OCS quorum ceremonies
+under `preload`, vendor `CKA_NFKM_*` attributes, recipes for reading the
+Security World key-generation timestamp, and FIPS 140-3 algorithm
+constraints — see [`NSHIELD.md`](NSHIELD.md).
 
 ## Features
 
@@ -21,9 +21,10 @@ key-generation timestamp, and FIPS 140-3 algorithm constraints — see
   while preserving every existing subkey, UID, and historical signature
 - Standalone primary-key and subkey revocation certificates
 - PKCS#11 key selection by URI (RFC 7512), `CKA_LABEL`, `CKA_ID`, or auto
-- Three authentication modes: module-protected (no login), softcard /
-  single-card OCS (PIN), and nShield K/N quorum OCS (`C_LoginBegin` /
-  `C_LoginNext` / `C_LoginEnd`)
+- Two authentication modes: module-protected (no login) and softcard /
+  single-card OCS (PIN).  K>1 OCS quorums are handled by wrapping the
+  invocation in nShield's `preload` utility, which feeds an
+  already-authenticated PKCS#11 session into `sq-pkcs11`.
 - Stable fingerprints across separate `cert-export` and `sign` invocations
 - Multi-HSM aware: handles two or more nShield modules in one Security
   World transparently for module-protected keys
@@ -38,8 +39,9 @@ key-generation timestamp, and FIPS 140-3 algorithm constraints — see
 - A C toolchain and OpenSSL development headers (`libssl-dev` /
   `openssl-devel`) for building Sequoia's OpenSSL crypto backend
 - A PKCS#11 v2.40+ module from your HSM vendor at runtime
-- For the `--ocs` quorum login path: an nShield PKCS#11 module that
-  exports `C_LoginBegin`, `C_LoginNext`, `C_LoginEnd`
+- For K/N OCS quorum logins on nShield: the `preload` utility (shipped
+  with the nShield Security World software) — see
+  [`NSHIELD.md`](NSHIELD.md) for the wrapper recipe
 
 ## Building
 
@@ -98,12 +100,14 @@ OCS slots. For module-protected keys, any of the three forms works.
 |---|---|
 | Module-protected | no auth flag — login is not required |
 | Softcard / single-card OCS | `--pin-file <path>` or `SQ_PKCS11_PIN` env var |
-| nShield K/N quorum OCS | `--ocs` — the tool prompts per card via `rpassword` |
+| nShield K/N quorum OCS | wrap the invocation in `preload` — see [`NSHIELD.md`](NSHIELD.md) |
 
-For OCS quorum login, the operator(s) must insert their cards into
-readers connected to the nShield host before running the command. The
-`--ocs` path uses nShield's vendor extension functions and is not
-available in load-sharing or HSM Pool mode (use `preload` for those).
+For K/N OCS quorum logins on nShield, the quorum ceremony runs in
+`preload` (which already has a mature interactive UI for it), and
+`sq-pkcs11` inherits the preloaded OCS via the PKCS#11 module — no
+`--pin-file` is needed in that mode.  `preload` also handles HSM Pool
+mode and load-sharing topologies that the standalone PKCS#11 `C_Login`
+flow doesn't.
 
 ### Exporting an OpenPGP certificate (single-key)
 
@@ -129,26 +133,29 @@ long-lived `Certify`-only primary key kept under strong protection
 protection for unattended use:
 
 ```sh
-./sq-pkcs11 cert-export \
-  --key-label  "openssl-release-primary"      --ocs \
-  --subkey-label "openssl-release-sign-2026"  \
-  --userid "OpenSSL Release Key <openssl-security@openssl.org>" \
-  --creation-time         2026-05-01T00:00:00Z --validity-period         10y \
-  --subkey-creation-time  2026-05-01T00:00:00Z --subkey-validity-period  2y  \
-  --output release.asc
+preload -c openssl-release-primary -- \
+  ./sq-pkcs11 cert-export \
+    --key-label  "openssl-release-primary" \
+    --subkey-label "openssl-release-sign-2026"  \
+    --userid "OpenSSL Release Key <openssl-security@openssl.org>" \
+    --creation-time         2026-05-01T00:00:00Z --validity-period         10y \
+    --subkey-creation-time  2026-05-01T00:00:00Z --subkey-validity-period  2y  \
+    --output release.asc
 ```
 
 This is a one-off ceremony performed annually (or whenever the subkey
-is rotated). The operators load OCS cards, the tool prompts for the
-passphrases, and emits a single cert containing primary + subkey with
-the proper subkey-binding signature and cross-signature.
+is rotated). `preload` runs the OCS quorum interactively (`-c <cardset>`
+takes the operators through inserting their cards and entering each
+passphrase), then `sq-pkcs11` runs against the preloaded session and
+emits a single cert containing primary + subkey with the proper
+subkey-binding signature and cross-signature.
 
 Each tier authenticates independently:
 
 | Flag | Tier |
 |---|---|
-| `--pin-file` / `--ocs` | primary |
-| `--subkey-pin-file` / `--subkey-ocs` | subkey |
+| `--pin-file` (or `preload` wrapper) | primary |
+| `--subkey-pin-file` (or `preload` wrapper) | subkey |
 
 (Passphrases are read from a file or the `SQ_PKCS11_PIN` /
 `SQ_PKCS11_SUBKEY_PIN` env vars; there is no `--pin <PASS>` value
@@ -280,12 +287,13 @@ to mark the key as revoked.
 Primary-key revocation (entire cert is dead):
 
 ```sh
-./sq-pkcs11 cert-revoke \
-  --key-label     openssl-release-primary --ocs \
-  --creation-time 2026-05-01T00:00:00Z \
-  --reason        compromised \
-  --message       "primary HSM was decommissioned" \
-  --output        release-revocation.asc
+preload -c openssl-release-primary -- \
+  ./sq-pkcs11 cert-revoke \
+    --key-label     openssl-release-primary \
+    --creation-time 2026-05-01T00:00:00Z \
+    --reason        compromised \
+    --message       "primary HSM was decommissioned" \
+    --output        release-revocation.asc
 ```
 
 Subkey revocation (cert remains valid; one subkey is retired).
@@ -298,14 +306,15 @@ the subkey's private material has been deleted, lost, or compromised:
 sq inspect release.asc                 # or
 gpg --list-keys --with-subkey-fingerprint
 
-./sq-pkcs11 subkey-revoke \
-  --key-label              openssl-release-primary --ocs \
-  --creation-time          2026-05-01T00:00:00Z \
-  --input-cert             release.asc \
-  --subkey-fingerprint     70F222DB97E8304B93112F1B998B87DB3AFDA5A8 \
-  --reason                 superseded \
-  --message                "rotated to openssl-release-sign-2027" \
-  --output                 sign-2026-revocation.asc
+preload -c openssl-release-primary -- \
+  ./sq-pkcs11 subkey-revoke \
+    --key-label              openssl-release-primary \
+    --creation-time          2026-05-01T00:00:00Z \
+    --input-cert             release.asc \
+    --subkey-fingerprint     70F222DB97E8304B93112F1B998B87DB3AFDA5A8 \
+    --reason                 superseded \
+    --message                "rotated to openssl-release-sign-2027" \
+    --output                 sign-2026-revocation.asc
 ```
 
 `subkey-revoke` exercises only the primary's private key in the HSM.
@@ -448,10 +457,12 @@ hashes the OpenPGP-formatted data, the digest is wrapped in a DER
 - **No keyserver upload**: the certificate is printed to stdout or
   written to a file; uploading it is left to your existing tooling
   (`gpg --send-keys`, `hkp-tool`, `sq keyring publish`, ...).
-- **OCS quorum is nShield-specific**: `C_LoginBegin`/`C_LoginNext`/
-  `C_LoginEnd` are vendor extensions. On non-nShield HSMs use
-  `--pin-file` (single-card OCS works that way) or your vendor's preload
-  equivalent.
+- **OCS K/N quorum logins are nShield-specific**: handled by wrapping
+  the invocation in `preload`, which is part of the nShield Security
+  World software and not portable.  On non-nShield HSMs that support
+  K=1 OCS or softcards, `--pin-file` works.  Other vendor quorum
+  schemes (Thales/Luna MofN, AWS CloudHSM quorum) need their own
+  preload-equivalent or out-of-band auth.
 - **HSM-dependent code is not unit-tested**: the actual signing path,
   slot/login logic, and certificate assembly require a real HSM. They
   are exercised by manual integration tests against an nShield 5c. The

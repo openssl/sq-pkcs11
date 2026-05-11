@@ -46,9 +46,6 @@ humantime = "2"
 # clock/now or the IANA timezone database.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# Direct symbol loading for nShield extension functions (C_LoginBegin/Next/End)
-libloading = "0.8"
-
 [dev-dependencies]
 # CLI integration test scaffolding
 assert_cmd = "2"

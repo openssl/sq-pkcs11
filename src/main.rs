@@ -1,6 +1,5 @@
 mod cert;
 mod error;
-mod nshield;
 mod session;
 mod signer;
 
@@ -117,23 +116,17 @@ struct AuthArgs {
     /// when this flag is absent.  There is no `--pin <PASS>` value flag
     /// because passphrases on the command line leak through process
     /// listings and shell history.
-    #[arg(long, value_name = "FILE", group = "auth")]
+    ///
+    /// For K>1 OCS quorum logins, wrap the sq-pkcs11 invocation in nShield's
+    /// `preload` utility — it runs the quorum ceremony, and sq-pkcs11
+    /// inherits the preloaded session via the PKCS#11 module.  Omit
+    /// `--pin-file` in that case.
+    #[arg(long, value_name = "FILE")]
     pin_file: Option<PathBuf>,
-
-    /// Interactive OCS quorum login (K > 1 card sets).
-    /// The tool will prompt for each card's passphrase in turn using the
-    /// nShield C_LoginBegin / C_LoginNext / C_LoginEnd extension API.
-    #[arg(long, group = "auth")]
-    ocs: bool,
 }
 
 impl AuthArgs {
-    fn login_mode<'a>(&'a self, module: &'a std::path::Path) -> anyhow::Result<LoginMode<'a>> {
-        if self.ocs {
-            return Ok(LoginMode::OcsQuorum {
-                module_path: module,
-            });
-        }
+    fn login_mode(&self) -> anyhow::Result<LoginMode> {
         if let Some(path) = &self.pin_file {
             return Ok(LoginMode::Pin(read_pin_file(path)?));
         }
@@ -316,17 +309,11 @@ struct CertExportArgs {
     /// single-card-OCS-protected.  Same semantics as --pin-file.  The
     /// `SQ_PKCS11_SUBKEY_PIN` environment variable is read when this flag
     /// is absent.  No `--subkey-pin <PASS>` value flag — see --pin-file.
-    #[arg(
-        long,
-        value_name = "FILE",
-        group = "subkey_auth",
-        requires = "subkey_selector"
-    )]
+    ///
+    /// For K>1 OCS quorum subkeys, wrap the invocation in nShield's
+    /// `preload` and omit this flag.
+    #[arg(long, value_name = "FILE", requires = "subkey_selector")]
     subkey_pin_file: Option<PathBuf>,
-
-    /// Use nShield K/N quorum login for the subkey.
-    #[arg(long, group = "subkey_auth", requires = "subkey_selector")]
-    subkey_ocs: bool,
 
     /// Subkey creation time (RFC 3339).  Same semantics as --creation-time.
     #[arg(long, value_name = "TIMESTAMP", requires = "subkey_selector")]
@@ -531,12 +518,12 @@ fn main() -> anyhow::Result<()> {
     pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
 
     match cli.command {
-        Command::Sign(args) => cmd_sign(&pkcs11, &module, args),
-        Command::CertExport(args) => cmd_cert_export(&pkcs11, &module, args),
-        Command::CertRevoke(args) => cmd_cert_revoke(&pkcs11, &module, args),
-        Command::SubkeyRevoke(args) => cmd_subkey_revoke(&pkcs11, &module, args),
+        Command::Sign(args) => cmd_sign(&pkcs11, args),
+        Command::CertExport(args) => cmd_cert_export(&pkcs11, args),
+        Command::CertRevoke(args) => cmd_cert_revoke(&pkcs11, args),
+        Command::SubkeyRevoke(args) => cmd_subkey_revoke(&pkcs11, args),
         Command::ListKeys(args) => cmd_list_keys(&pkcs11, args),
-        Command::VerifySigningKey(args) => cmd_verify_signing_key(&pkcs11, &module, args),
+        Command::VerifySigningKey(args) => cmd_verify_signing_key(&pkcs11, args),
     }
 }
 
@@ -548,7 +535,6 @@ trait HasSubkeyArgs {
     fn subkey_id(&self) -> Option<&str>;
     fn subkey_auto(&self) -> bool;
     fn subkey_pin_file(&self) -> Option<&std::path::Path>;
-    fn subkey_ocs(&self) -> bool;
 }
 
 impl HasSubkeyArgs for CertExportArgs {
@@ -566,9 +552,6 @@ impl HasSubkeyArgs for CertExportArgs {
     }
     fn subkey_pin_file(&self) -> Option<&std::path::Path> {
         self.subkey_pin_file.as_deref()
-    }
-    fn subkey_ocs(&self) -> bool {
-        self.subkey_ocs
     }
 }
 
@@ -593,16 +576,9 @@ fn resolve_subkey_selector<A: HasSubkeyArgs>(args: &A) -> anyhow::Result<Option<
     Ok(None)
 }
 
-/// Build a `LoginMode` for the subkey from --subkey-pin / --subkey-ocs.
-fn build_subkey_login<'a, A: HasSubkeyArgs>(
-    args: &'a A,
-    module: &'a std::path::Path,
-) -> anyhow::Result<LoginMode<'a>> {
-    if args.subkey_ocs() {
-        return Ok(LoginMode::OcsQuorum {
-            module_path: module,
-        });
-    }
+/// Build a `LoginMode` for the subkey from --subkey-pin-file or
+/// `SQ_PKCS11_SUBKEY_PIN`.
+fn build_subkey_login<A: HasSubkeyArgs>(args: &A) -> anyhow::Result<LoginMode> {
     if let Some(path) = args.subkey_pin_file() {
         return Ok(LoginMode::Pin(read_pin_file(path)?));
     }
@@ -781,9 +757,9 @@ fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 // sign
 // ---------------------------------------------------------------------------
 
-fn cmd_sign(pkcs11: &Pkcs11, module: &std::path::Path, args: SignArgs) -> anyhow::Result<()> {
+fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
-    let login = args.auth.login_mode(module)?;
+    let login = args.auth.login_mode()?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
 
     // Resolve the output path first, then preflight the overwrite check
@@ -864,11 +840,7 @@ enum SignOutput {
 // cert-export
 // ---------------------------------------------------------------------------
 
-fn cmd_cert_export(
-    pkcs11: &Pkcs11,
-    module: &std::path::Path,
-    args: CertExportArgs,
-) -> anyhow::Result<()> {
+fn cmd_cert_export(pkcs11: &Pkcs11, args: CertExportArgs) -> anyhow::Result<()> {
     // Preflight overwrite before any HSM round trip.  cert-export
     // produces multiple signatures (direct-key, every UID binding, and
     // the subkey binding + cross-sig if a subkey is requested) — wasting
@@ -877,7 +849,7 @@ fn cmd_cert_export(
 
     // ── Primary tier ─────────────────────────────────────────────────
     let primary_selector = args.key.resolve()?;
-    let primary_login = args.auth.login_mode(module)?;
+    let primary_login = args.auth.login_mode()?;
     let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let primary_validity = if args.no_expiration {
         None
@@ -899,7 +871,7 @@ fn cmd_cert_export(
     let subkey_validity;
 
     if let Some(sel) = &subkey_selector {
-        let subkey_login = build_subkey_login(&args, module)?;
+        let subkey_login = build_subkey_login(&args)?;
         subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
         subkey_validity = if args.subkey_no_expiration {
             None
@@ -975,16 +947,12 @@ fn cmd_cert_export(
 // cert-revoke
 // ---------------------------------------------------------------------------
 
-fn cmd_cert_revoke(
-    pkcs11: &Pkcs11,
-    module: &std::path::Path,
-    args: CertRevokeArgs,
-) -> anyhow::Result<()> {
+fn cmd_cert_revoke(pkcs11: &Pkcs11, args: CertRevokeArgs) -> anyhow::Result<()> {
     // Preflight overwrite before opening any HSM session.
     preflight_overwrite(args.output.as_deref(), args.force)?;
 
     let selector = args.key.resolve()?;
-    let login = args.auth.login_mode(module)?;
+    let login = args.auth.login_mode()?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let revocation_time = match args.revocation_time.as_deref() {
         Some(s) => parse_creation_time(Some(s))?,
@@ -1014,13 +982,9 @@ fn cmd_cert_revoke(
 // subkey-revoke
 // ---------------------------------------------------------------------------
 
-fn cmd_subkey_revoke(
-    pkcs11: &Pkcs11,
-    module: &std::path::Path,
-    args: SubkeyRevokeArgs,
-) -> anyhow::Result<()> {
+fn cmd_subkey_revoke(pkcs11: &Pkcs11, args: SubkeyRevokeArgs) -> anyhow::Result<()> {
     let primary_selector = args.key.resolve()?;
-    let primary_login = args.auth.login_mode(module)?;
+    let primary_login = args.auth.login_mode()?;
     let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let revocation_time = match args.revocation_time.as_deref() {
         Some(s) => parse_creation_time(Some(s))?,
@@ -1166,16 +1130,12 @@ fn write_revocation_output(
 // verify-signing-key
 // ---------------------------------------------------------------------------
 
-fn cmd_verify_signing_key(
-    pkcs11: &Pkcs11,
-    module: &std::path::Path,
-    args: VerifySigningKeyArgs,
-) -> anyhow::Result<()> {
+fn cmd_verify_signing_key(pkcs11: &Pkcs11, args: VerifySigningKeyArgs) -> anyhow::Result<()> {
     use sequoia_openpgp::policy::StandardPolicy;
     use sequoia_openpgp::types::KeyFlags;
 
     let selector = args.key.resolve()?;
-    let login = args.auth.login_mode(module)?;
+    let login = args.auth.login_mode()?;
     let creation_time = parse_creation_time(args.creation_time.as_deref())?;
     let at_time = match args.at_time.as_deref() {
         Some(s) => parse_creation_time(Some(s))?,

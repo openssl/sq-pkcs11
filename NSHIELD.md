@@ -28,37 +28,51 @@ through nShield's own command-line tools:
 | `createocs` / `ppmk` | create Operator Card Sets / softcards |
 | `nfkminfo` | inspect Security World, list keys, dump key metadata |
 | `cklist` (in `/opt/nfast/bin`) | dump full PKCS#11 attribute set per object, including vendor `CKA_NFKM_*` |
-| `preload` | load OCS-protected keys into the HSM ahead of an unattended client (we don't use this — `sq-pkcs11 --ocs` calls the K/N login extension directly) |
+| `preload` | run the K/N OCS quorum ceremony and hand off an authenticated session to `sq-pkcs11` (the recommended path for K>1 logins) |
 
-## OCS quorum login: `C_LoginBegin` / `C_LoginNext` / `C_LoginEnd`
+## OCS K/N quorum login via `preload`
 
-For Operator Card Sets with K > 1 (a quorum of cards), nShield exposes
-**vendor extension functions** beyond the PKCS#11 standard:
+For Operator Card Sets with K > 1 (a quorum of cards), wrap the
+`sq-pkcs11` invocation in nShield's `preload` utility.  `preload` runs
+the interactive ceremony — slot polling, "X of K cards read" progress,
+per-card passphrase prompts — and then exec()s the child process with
+the preloaded OCS available through the PKCS#11 module:
 
-```c
-CK_RV C_LoginBegin(CK_SESSION_HANDLE, CK_USER_TYPE,
-                   CK_ULONG_PTR k_out, CK_ULONG_PTR n_out);
-CK_RV C_LoginNext (CK_SESSION_HANDLE, CK_USER_TYPE,
-                   CK_CHAR_PTR pin, CK_ULONG pin_len,
-                   CK_ULONG_PTR shares_left);
-CK_RV C_LoginEnd  (CK_SESSION_HANDLE, CK_USER_TYPE);
+```sh
+preload -c openssl-release-primary -- \
+  sq-pkcs11 cert-export \
+    --key-label  openssl-release-primary \
+    --userid     "OpenSSL Release Key <openssl-security@openssl.org>" \
+    ...
 ```
 
-`sq-pkcs11`'s `--ocs` flag invokes this trio directly via `libloading`,
-bypassing the standard `C_Login`.  Source: `src/nshield.rs`.
+From `sq-pkcs11`'s side the session looks already-authenticated — no
+`--pin-file` is needed, and there is no `--ocs` flag.  The PKCS#11
+module picks up the preloaded cardset and treats the session as
+logged-in; with most nShield setups the standard `C_Login` is bypassed
+internally.
 
-Important nShield restrictions on this path:
+Why preload rather than calling `C_LoginBegin` / `C_LoginNext` /
+`C_LoginEnd` ourselves:
 
-- **Not available in HSM Pool mode** — use `preload` for those topologies.
-- **Not available in load-sharing mode** — use `preload` there too.
-- **Cards must be physically inserted before** the tool runs; the
-  extension API loads the share present in the reader at that moment.
-- All three calls (`Begin`, K × `Next`, `End`) must happen in the same
-  session; nShield aborts the sequence on any unrelated PKCS#11 call
-  or a card removal in between.
+- `preload` is the canonical nShield UX for K/N ceremonies — mature
+  slot-state display, ESN feedback, card-swap handling.
+- Works in HSM Pool and load-sharing topologies, where the
+  `C_LoginBegin` trio does not.
+- Removes a vendor-specific `dlopen` of nShield-only symbols from
+  `sq-pkcs11`, keeping the binary portable to other PKCS#11 modules.
 
-For K = 1 OCS, plain `C_Login` works — use `--pin-file <path>` (or the
-`SQ_PKCS11_PIN` env var).
+Environment requirements for the child:
+
+- `CKNFAST_LOADSHARING=1` should be set (it is the default in modern
+  Security World installs; verify on legacy hosts).  Without it, the
+  PKCS#11 module won't see the preloaded OCS and `sq-pkcs11` will
+  observe an un-authenticated session.
+- Cards must be inserted into readers connected to the nShield host
+  before the quorum prompts, exactly as today.
+
+For K = 1 OCS, plain `C_Login` still works — use `--pin-file <path>`
+(or the `SQ_PKCS11_PIN` env var) directly, without `preload`.
 
 ## Vendor `CKA_NFKM_*` attributes
 
@@ -158,10 +172,11 @@ appears identically on each module's accelerator slot, and the tool
 picks the first reachable slot for module-protected operations
 (`LoginMode::None`).  No action is required from the operator.
 
-For OCS-protected keys with `--ocs`, the OCS slot must be addressed
-explicitly via `--key-uri pkcs11:token=<ocs-name>;...` since multiple
-slots may carry the same OCS state — see the README's authentication
-section for the URI patterns.
+For OCS-protected keys (whether single-card via `--pin-file` or K/N
+quorum via `preload`), the OCS slot must be addressed explicitly via
+`--key-uri pkcs11:token=<ocs-name>;...` since multiple slots may carry
+the same OCS state — see the README's authentication section for the
+URI patterns.
 
 ## FIPS 140-3 algorithm constraints
 

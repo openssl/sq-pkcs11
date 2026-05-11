@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use cryptoki::{
     context::Pkcs11,
     object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle},
@@ -124,16 +122,21 @@ fn percent_decode_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// How to authenticate the session once it is open.
+///
+/// For K>1 OCS quorum logins, wrap the sq-pkcs11 invocation in nShield's
+/// `preload` utility — it runs the quorum ceremony, and the preloaded OCS
+/// is picked up by the PKCS#11 module so this end sees an already-
+/// authenticated session (typically `LoginMode::None`, or `Pin("")` for
+/// modules configured to still demand a C_Login call).
 #[derive(Debug)]
-pub enum LoginMode<'a> {
-    /// Module-protected key — no C_Login call needed.
+pub enum LoginMode {
+    /// Module-protected key, or a session pre-authenticated by `preload`
+    /// — no C_Login call needed.
     None,
     /// Softcard or single-card OCS (K=1): standard C_Login with a passphrase.
     /// The passphrase is owned because it may have been read from a file or
     /// environment variable that doesn't outlive the args struct.
     Pin(String),
-    /// OCS with K > 1: nShield C_LoginBegin / C_LoginNext / C_LoginEnd.
-    OcsQuorum { module_path: &'a Path },
 }
 
 /// Open a PKCS#11 session on the slot best matching `selector` and log in
@@ -151,7 +154,7 @@ pub enum LoginMode<'a> {
 pub fn open_session(
     pkcs11: &Pkcs11,
     selector: &KeySelector,
-    login_mode: &LoginMode<'_>,
+    login_mode: &LoginMode,
 ) -> Result<(Session, Slot)> {
     let slots = pkcs11.get_slots_with_initialized_token()?;
     if slots.is_empty() {
@@ -176,19 +179,6 @@ pub fn open_session(
 
         LoginMode::Pin(pin) => {
             session.login(UserType::User, Some(&AuthPin::from(pin.clone())))?;
-        }
-
-        LoginMode::OcsQuorum { module_path } => {
-            let ext = crate::nshield::NshieldQuorumLogin::load(module_path)?;
-            ext.quorum_login(session.handle(), |card_n, k, n| {
-                let prompt = format!(
-                    "Insert card {card_n} of {k} (K={k}/N={n}) and enter passphrase \
-                     (leave blank if not passphrase-protected): "
-                );
-                let pin = rpassword::prompt_password(prompt)
-                    .map_err(|e| anyhow::anyhow!("passphrase prompt failed: {e}"))?;
-                Ok(pin)
-            })?;
         }
     }
 
@@ -286,7 +276,7 @@ fn find_slot_by_uri(pkcs11: &Pkcs11, slots: &[Slot], uri: &Pkcs11Uri) -> Result<
 fn smart_slot_selection(
     pkcs11: &Pkcs11,
     slots: &[Slot],
-    login_mode: &LoginMode<'_>,
+    login_mode: &LoginMode,
 ) -> Result<Slot> {
     match login_mode {
         // Module-protected: filter out token slots that require login (OCS /
