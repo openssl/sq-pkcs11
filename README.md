@@ -270,6 +270,25 @@ merge a new subkey into the wrong cert.
 ./sq-pkcs11 sign --binary --output release.tar.gz.sig --key-label ... release.tar.gz
 ```
 
+Instead of remembering and passing `--creation-time`, point `sign` at the
+published certificate and let it derive the value:
+
+```sh
+./sq-pkcs11 sign \
+  --key-label my-signing-key \
+  --input-cert release.asc \
+  openssl-3.6.0.tar.gz
+```
+
+`--input-cert` locates the signing (sub)key in the cert by matching the HSM
+key's public material (RSA modulus+exponent / EC curve+point) and signs with
+**that key's** embedded creation time, so the signature's issuer fingerprint
+equals the published key's by construction. This is the robust choice for
+release signing and git tags: no timestamp to track, rotation-safe, and it
+cannot select the wrong subkey. If no key in the cert matches the HSM key, it
+errors rather than silently falling back to the epoch default. An explicit
+`--creation-time` still wins (and warns if it disagrees with the cert).
+
 Verify with GnuPG:
 
 ```sh
@@ -422,6 +441,11 @@ KEY_TIME=2026-05-01T00:00:00Z
 Once the certificate is uploaded to keyservers, the timestamp is
 permanent — never change it. A different value gives a different
 fingerprint, which from a verifier's perspective is a different key.
+
+Better still, once the certificate is published, pass it to `sign` as
+`--input-cert` (see [Signing a file](#signing-a-file)) and skip
+`--creation-time` entirely: the creation time is read back out of the cert by
+matching the HSM key's public material, so the two can never drift.
 
 ## Supported algorithms
 

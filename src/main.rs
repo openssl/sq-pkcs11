@@ -188,10 +188,29 @@ struct SignArgs {
     ///
     /// Must match the value used during cert-export so verifiers can resolve
     /// the issuer fingerprint to the distributed certificate.
-    /// Defaults to Unix epoch when omitted — use this default consistently
-    /// if you did not pass --creation-time during cert-export either.
+    ///
+    /// Precedence: an explicit --creation-time always wins (and warns if it
+    /// disagrees with the matching key in --input-cert).  Otherwise, if
+    /// --input-cert is given the creation time is derived from the cert.
+    /// Otherwise it defaults to Unix epoch — use this default consistently
+    /// only if you did not pass --creation-time during cert-export either.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
+
+    /// Published certificate to derive the key-creation time from when
+    /// --creation-time is not given (RFC 3339 path otherwise).
+    ///
+    /// The signing (sub)key is located in the cert by matching the HSM key's
+    /// public material — RSA modulus+exponent, or EC curve+point — and its
+    /// embedded creation time is used so the signature's issuer fingerprint
+    /// equals the published (sub)key's by construction.  This is the robust
+    /// way to sign release artefacts and git tags: no timestamp to remember,
+    /// rotation-safe, and it cannot select the wrong subkey.
+    ///
+    /// Errors if no key in the cert matches the HSM key's material — it never
+    /// silently falls back to the Unix-epoch default.
+    #[arg(long, value_name = "FILE")]
+    input_cert: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +779,14 @@ fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode()?;
-    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    // An explicit --creation-time, parsed now so a malformed timestamp fails
+    // before any HSM round-trip.  `None` here means "not supplied" (distinct
+    // from the epoch default applied later), which the precedence logic needs.
+    let explicit_creation_time = args
+        .creation_time
+        .as_deref()
+        .map(|s| parse_creation_time(Some(s)))
+        .transpose()?;
 
     // Resolve the output path first, then preflight the overwrite check
     // BEFORE opening the HSM session.  Without this, an accidental
@@ -784,9 +810,47 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
         preflight_overwrite(Some(path), args.force)?;
     }
 
+    // Parse --input-cert (if any) before any HSM round-trip so a malformed
+    // cert fails fast.
+    let input_cert = match args.input_cert.as_deref() {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading --input-cert {}", path.display()))?;
+            Some(cert::parse_cert(&bytes)?)
+        }
+        None => None,
+    };
+
     let (session, _slot) = session::open_session(pkcs11, &selector, &login)?;
     let priv_handle = session::resolve_single_key(&session, &selector)?;
     let mut signer = Pkcs11Signer::new(session, priv_handle)?;
+
+    // Determine the OpenPGP key-creation time to sign with, by precedence:
+    //   1. explicit --creation-time wins (warn if it disagrees with the
+    //      matching key in --input-cert);
+    //   2. else derive from --input-cert by matching public material;
+    //   3. else fall back to the Unix-epoch default for backward compat.
+    // `signer.public_key()` carries the HSM key's material; its (epoch)
+    // creation time here is irrelevant to matching, which is material-only.
+    let creation_time = match (explicit_creation_time, &input_cert) {
+        (Some(explicit), Some(cert)) => {
+            if let Ok(derived) = cert::creation_time_of_matching_key(cert, signer.public_key()) {
+                if derived != explicit {
+                    eprintln!(
+                        "warning: --creation-time {} disagrees with the matching key's \
+                         creation time in --input-cert ({}); signing with --creation-time \
+                         as given — the signature may not verify against that cert",
+                        humantime::format_rfc3339(explicit),
+                        humantime::format_rfc3339(derived),
+                    );
+                }
+            }
+            explicit
+        }
+        (Some(explicit), None) => explicit,
+        (None, Some(cert)) => cert::creation_time_of_matching_key(cert, signer.public_key())?,
+        (None, None) => std::time::SystemTime::UNIX_EPOCH,
+    };
     signer.set_creation_time(creation_time)?;
 
     // Pick the hash algorithm to match the signing key strength — same

@@ -350,6 +350,64 @@ pub fn parse_cert(bytes: &[u8]) -> Result<Cert> {
     Cert::from_bytes(bytes).map_err(|e| Error::Other(anyhow::anyhow!("parsing cert: {e}")))
 }
 
+/// Recover the OpenPGP key-creation time to sign with by matching an HSM
+/// key against the keys in a published certificate.
+///
+/// An OpenPGP fingerprint is `hash(public-key-material + creation-time)`, so a
+/// signature's issuer fingerprint only resolves to the published signing
+/// (sub)key if `sign` uses that (sub)key's exact creation time.  The HSM only
+/// hands back the public *material* (RSA modulus+exponent, EC curve+point) —
+/// it has no notion of an OpenPGP creation time — so we recover the creation
+/// time from the cert.
+///
+/// Matching is deliberately on the raw public material, **not** the
+/// fingerprint: the fingerprint is exactly what we are trying to reconstruct,
+/// so it cannot be the lookup key.  Material matching is also rotation-safe —
+/// each rotated subkey has distinct material, so there is no text to parse and
+/// no way to pick the wrong subkey.
+///
+/// `cert.keys()` covers the primary and every subkey, so a single-tier cert
+/// (primary carries the signing flag) and a primary+signing-subkey cert are
+/// both handled.  Errors clearly if nothing matches — never silently falls
+/// back to a default.
+pub fn creation_time_of_matching_key(
+    cert: &Cert,
+    hsm_public: &Key<PublicParts, UnspecifiedRole>,
+) -> Result<std::time::SystemTime> {
+    let needle = hsm_public.mpis();
+    let mut found: Option<std::time::SystemTime> = None;
+    for ka in cert.keys() {
+        if ka.key().mpis() == needle {
+            let ct = ka.key().creation_time();
+            match found {
+                None => found = Some(ct),
+                // Same material bound twice with the same creation time is
+                // harmless (the key appears once for our purposes).
+                Some(prev) if prev == ct => {}
+                // Same material under two *different* creation times yields
+                // two different fingerprints — we cannot know which the
+                // verifier expects.  Refuse rather than guess.
+                Some(prev) => {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "input cert binds the HSM key's public material under two different \
+                         creation times ({} and {}); cannot unambiguously derive the \
+                         signature creation time — pass --creation-time explicitly",
+                        humantime::format_rfc3339(prev),
+                        humantime::format_rfc3339(ct),
+                    )));
+                }
+            }
+        }
+    }
+    found.ok_or_else(|| {
+        Error::Other(anyhow::anyhow!(
+            "no key in the input cert matches the HSM signing key's public material \
+             (compared RSA modulus+exponent / EC curve+point); the wrong certificate, or \
+             the wrong --key-label/--key-id/--key-uri, may have been supplied"
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Hash algorithm helpers
 // ---------------------------------------------------------------------------
@@ -469,5 +527,100 @@ mod tests {
             ppr = next;
         }
         assert_eq!(count, 1, "expected exactly one packet, got {count}");
+    }
+
+    // -------------------------------------------------------------------
+    // creation_time_of_matching_key
+    // -------------------------------------------------------------------
+
+    /// Build an HSM-style public key from existing material, stamped at the
+    /// Unix epoch — exactly how `Pkcs11Signer` presents a freshly-read key
+    /// before any creation time is known.
+    fn hsm_like(
+        pk_algo: sequoia_openpgp::types::PublicKeyAlgorithm,
+        mpis: &mpi::PublicKey,
+    ) -> Key<PublicParts, UnspecifiedRole> {
+        let key = Key4::<PublicParts, PrimaryRole>::new(
+            std::time::SystemTime::UNIX_EPOCH,
+            pk_algo,
+            mpis.clone(),
+        )
+        .expect("Key4 from material");
+        sequoia_openpgp::packet::Key::V4(key.role_into_unspecified())
+    }
+
+    #[test]
+    fn matches_subkey_by_material_not_fingerprint() {
+        // A cert with a known creation time and a dedicated signing subkey.
+        let t = humantime::parse_rfc3339("2026-05-26T15:08:47Z").unwrap();
+        let (cert, _rev) = CertBuilder::new()
+            .set_cipher_suite(CipherSuite::P256)
+            .set_creation_time(t)
+            .add_userid("Test <test@example.com>")
+            .add_signing_subkey()
+            .generate()
+            .expect("software cert with signing subkey");
+
+        let subkey = cert.keys().subkeys().next().expect("a signing subkey");
+        let hsm = hsm_like(subkey.key().pk_algo(), subkey.key().mpis());
+
+        // The epoch-stamped HSM key has a *different* fingerprint than the
+        // published subkey — so a fingerprint-keyed lookup would miss it.
+        assert_ne!(
+            hsm.fingerprint(),
+            subkey.key().fingerprint(),
+            "test premise: epoch HSM key must differ from cert subkey by fingerprint"
+        );
+
+        // Material matching still finds it and recovers the subkey's time.
+        let found = creation_time_of_matching_key(&cert, &hsm).expect("match by material");
+        assert_eq!(found, subkey.key().creation_time());
+    }
+
+    #[test]
+    fn matches_primary_in_single_tier_cert() {
+        // No subkey: the primary itself carries the signing flag.  The HSM
+        // key is the primary's material; matching recovers the primary time.
+        let t = humantime::parse_rfc3339("2026-01-02T03:04:05Z").unwrap();
+        let (cert, _rev) = CertBuilder::new()
+            .set_cipher_suite(CipherSuite::P256)
+            .set_creation_time(t)
+            .add_userid("Solo <solo@example.com>")
+            .generate()
+            .expect("single-tier software cert");
+
+        let primary = cert.primary_key();
+        let hsm = hsm_like(primary.key().pk_algo(), primary.key().mpis());
+
+        let found = creation_time_of_matching_key(&cert, &hsm).expect("match primary");
+        assert_eq!(found, primary.key().creation_time());
+    }
+
+    #[test]
+    fn no_match_errors_clearly() {
+        // The HSM key's material is absent from the supplied cert (it belongs
+        // to a different, unrelated cert) — must error, never fall back.
+        let (cert_a, _) = CertBuilder::new()
+            .set_cipher_suite(CipherSuite::P256)
+            .add_userid("A <a@example.com>")
+            .add_signing_subkey()
+            .generate()
+            .expect("cert A");
+        let (cert_b, _) = CertBuilder::new()
+            .set_cipher_suite(CipherSuite::P256)
+            .add_userid("B <b@example.com>")
+            .generate()
+            .expect("cert B");
+
+        let foreign = cert_b.primary_key();
+        let hsm = hsm_like(foreign.key().pk_algo(), foreign.key().mpis());
+
+        let err = creation_time_of_matching_key(&cert_a, &hsm)
+            .expect_err("foreign key must not match")
+            .to_string();
+        assert!(
+            err.contains("no key in the input cert matches"),
+            "expected a clear no-match error, got: {err}"
+        );
     }
 }

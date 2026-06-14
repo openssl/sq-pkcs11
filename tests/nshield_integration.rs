@@ -2855,6 +2855,125 @@ fn signature_issuer_is_the_subkey_in_two_tier_cert() {
     );
 }
 
+/// `sign --input-cert <cert>` (no `--creation-time`) must derive the
+/// signing subkey's *published* creation time from the cert, so the
+/// signature's issuer fingerprint equals the published subkey's — and the
+/// signature verifies against that cert.  This is the git-tag-shim bug:
+/// without a creation time, `sign` used to default to the Unix epoch and
+/// produce an issuer fingerprint that resolves to no published key.
+#[test]
+fn sign_input_cert_derives_subkey_creation_time() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.asc");
+    let payload = tmp.path().join("p.txt");
+    let signature_path = tmp.path().join("p.txt.asc");
+    let sq_home = fresh_sq_home(&tmp);
+
+    std::fs::write(&payload, b"input-cert derivation\n").unwrap();
+
+    // Two-tier cert with the subkey created at a *non-epoch* time.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.primary_label])
+        .args(["--subkey-label", &env.subkey_label])
+        .args(["--userid", "InputCert <ic@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--subkey-creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    // Sign with the subkey, deriving the creation time from --input-cert.
+    // Crucially: NO --creation-time is passed.
+    sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.subkey_label])
+        .args(["--input-cert"])
+        .arg(&cert_path)
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let cert = parse_cert_file(&cert_path);
+    let subkey_fpr = cert
+        .keys()
+        .subkeys()
+        .next()
+        .expect("subkey present")
+        .key()
+        .fingerprint();
+
+    // The issuer fingerprint must equal the published subkey's — which is
+    // only true if `sign` recovered STABLE_TIME from the cert rather than
+    // defaulting to the epoch (a different fingerprint).
+    let sig = parse_signature_file(&signature_path);
+    let issuer_fprs: Vec<_> = sig.issuer_fingerprints().cloned().collect();
+    assert!(
+        issuer_fprs.iter().any(|f| f == &subkey_fpr),
+        "issuer must be the published subkey {subkey_fpr} (derived from --input-cert), \
+         got {issuer_fprs:?}"
+    );
+
+    // End-to-end: the signature verifies against the published cert — the
+    // sq analogue of `git verify-tag` reporting a Good signature.
+    let verify = sq_cli(&sq_home)
+        .arg("verify")
+        .arg("--signer-file")
+        .arg(&cert_path)
+        .arg("--signature-file")
+        .arg(&signature_path)
+        .arg(&payload)
+        .output()
+        .expect("sq verify");
+    assert!(
+        verify.status.success(),
+        "sq verify against the published cert must succeed:\nstderr: {}",
+        String::from_utf8_lossy(&verify.stderr),
+    );
+}
+
+/// A mismatched `--input-cert` (one that does not contain the HSM signing
+/// key's public material) must fail loudly rather than silently falling
+/// back to the epoch default and emitting a misleading signature.
+#[test]
+fn sign_input_cert_rejects_unrelated_cert() {
+    let env = require_env!();
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("rsa-cert.asc");
+    let payload = tmp.path().join("p.txt");
+
+    std::fs::write(&payload, b"unrelated cert\n").unwrap();
+
+    // Export a cert for the RSA key only.
+    sq_pkcs11(&env)
+        .args(["cert-export"])
+        .args(["--key-label", &env.rsa_label])
+        .args(["--userid", "Unrelated <un@example.com>"])
+        .args(["--creation-time", STABLE_TIME])
+        .args(["--output"])
+        .arg(&cert_path)
+        .assert()
+        .success();
+
+    // Try to sign with the *EC* key but hand it the RSA cert — no key in
+    // the cert matches the EC key's material, so derivation must error.
+    let assert = sq_pkcs11(&env)
+        .args(["sign"])
+        .args(["--key-label", &env.ec_label])
+        .args(["--input-cert"])
+        .arg(&cert_path)
+        .arg(&payload)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("no key in the input cert matches"),
+        "expected a clear material-mismatch error in stderr, got: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tiny extension trait so we can write `.assert_success()` on std::Command.
 // ---------------------------------------------------------------------------
