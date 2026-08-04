@@ -24,6 +24,7 @@ used, so an existing test.env keeps working.
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shlex
@@ -32,6 +33,7 @@ import stat
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -192,7 +194,36 @@ def pytest_report_header() -> list[str]:
         f"  pin file: {CONFIG.get('SQ_PKCS11_TEST_PIN_FILE') or '<none — module-protected>'}"
     )
     lines += [f"  note:     {note}" for note in CONFIG_NOTES]
+    lines += _stray_container_note()
     return lines
+
+
+def _stray_container_note() -> list[str]:
+    """Mention containers a previous session left behind.
+
+    Not removed automatically: another session may be running them right now,
+    and yanking its targets mid-test would be worse than the leak.
+    """
+    runtime = shutil.which("podman") or shutil.which("docker")
+    if runtime is None:
+        return []
+    try:
+        found = subprocess.run(
+            [runtime, "ps", "-aq", "--filter", f"label={CONTAINER_LABEL_KEY}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    count = len(found.stdout.split())
+    if not count:
+        return []
+    return [
+        f"  strays:   {count} container(s) from an earlier run; if no other "
+        f"session is active, remove with",
+        f"            {runtime} rm -f $({runtime} ps -aq --filter label={CONTAINER_LABEL_KEY})",
+    ]
 
 
 def child_env(**extra: str) -> dict[str, str]:
@@ -475,11 +506,21 @@ class Gpg:
 
 
 @pytest.fixture
-def gpg_home(tmp_path: Path) -> Path:
+def gpg_home(tmp_path: Path):
     home = tmp_path / "gnupg"
     home.mkdir()
     home.chmod(stat.S_IRWXU)  # gpg insists on 0700
-    return home
+    yield home
+    # Importing a key starts a gpg-agent (and scdaemon) that daemonises and
+    # outlives pytest, one pair per test, each holding sockets in a directory
+    # we are about to forget about.  Ask them to stop.
+    gpgconf = shutil.which("gpgconf")
+    if gpgconf is not None:
+        subprocess.run(
+            [gpgconf, "--homedir", str(home), "--kill", "all"],
+            capture_output=True,
+            timeout=30,
+        )
 
 
 @pytest.fixture
@@ -561,6 +602,48 @@ def container_runtime() -> str:
 # wiring: rpm 4.16 and 4.19 expand %__gpg_sign_cmd differently, and only real
 # rpmsign of that version exercises its own contract.
 # ---------------------------------------------------------------------------
+
+# Every container this session starts carries this label, so teardown can find
+# one whose id we lost — and so a container that escapes a hard kill can still
+# be identified afterwards.
+CONTAINER_LABEL_KEY = "sq-pkcs11-tests"
+CONTAINER_LABEL = f"{CONTAINER_LABEL_KEY}={uuid4().hex[:12]}"
+
+# (runtime, container id) for everything still running.
+_STARTED: set[tuple[str, str]] = set()
+
+
+def _sweep_containers() -> None:
+    """Remove every container this session started.  Idempotent.
+
+    Called from the fixture's own teardown, from pytest_sessionfinish, and from
+    atexit, because a Ctrl-C can land in any of several places — including
+    inside the subprocess call that creates a container, before the fixture has
+    a finaliser to run.  The label pass catches ids that never made it into the
+    registry.
+    """
+    for runtime, cid in sorted(_STARTED):
+        subprocess.run([runtime, "rm", "-f", cid], capture_output=True, timeout=120)
+    _STARTED.clear()
+    for runtime in ("podman", "docker"):
+        if not shutil.which(runtime):
+            continue
+        found = subprocess.run(
+            [runtime, "ps", "-aq", "--filter", f"label={CONTAINER_LABEL}"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        for cid in found.stdout.split():
+            subprocess.run([runtime, "rm", "-f", cid], capture_output=True, timeout=120)
+
+
+atexit.register(_sweep_containers)
+
+
+def pytest_sessionfinish() -> None:
+    _sweep_containers()
+
 
 # Fixed paths the signing environment is mounted at inside a target.
 IN_BINARY = "/opt/sq-pkcs11/sq-pkcs11"
@@ -720,7 +803,15 @@ def _start_target(
     artifacts: Path,
     extra_mounts: Sequence[str] = (),
 ) -> Target:
-    argv = [runtime, "run", "-d", "-v", f"{artifacts}:/artifacts:ro"]
+    argv = [
+        runtime,
+        "run",
+        "-d",
+        "--label",
+        CONTAINER_LABEL,
+        "-v",
+        f"{artifacts}:/artifacts:ro",
+    ]
     for mount in extra_mounts:
         argv += ["-v", mount]
     # Whatever else the token needs from the runtime.  Under rootless podman an
@@ -736,6 +827,7 @@ def _start_target(
     if proc.returncode != 0:
         pytest.skip(f"could not start {image}: {proc.stderr.strip()}")
     target = Target(runtime, family, image, note, proc.stdout.strip())
+    _STARTED.add((runtime, target.cid))
     setup = target.run(_TARGET_SETUP[family])
     if setup.returncode != 0:
         # Preparing a target is environment, not product: a container that
@@ -743,10 +835,15 @@ def _start_target(
         # because SQ_PKCS11_TEST_CONTAINER_ARGS made it someone else — is a
         # reason to skip with the message, not to fail.  Remove the container
         # first; the fixture's cleanup has not been armed yet.
-        subprocess.run([runtime, "rm", "-f", target.cid], capture_output=True)
+        _remove_container(runtime, target.cid)
         detail = (setup.stderr or setup.stdout).strip().splitlines()
         pytest.skip(f"could not prepare {image}: {detail[-1] if detail else 'no output'}")
     return target
+
+
+def _remove_container(runtime: str, cid: str) -> None:
+    subprocess.run([runtime, "rm", "-f", cid], capture_output=True, timeout=120)
+    _STARTED.discard((runtime, cid))
 
 
 def _target_fixture(targets: Sequence[tuple[str, str, str]], signing: bool = False):
@@ -782,7 +879,7 @@ def _target_fixture(targets: Sequence[tuple[str, str, str]], signing: bool = Fal
                     )
             yield target
         finally:
-            subprocess.run([container_runtime, "rm", "-f", target.cid], capture_output=True)
+            _remove_container(container_runtime, target.cid)
 
     return _fixture
 
