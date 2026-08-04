@@ -68,7 +68,7 @@ ignore = [
 [tool.ruff.lint.isort]
 # Not a package, so these resolve as top-level modules — the same way pytest
 # imports them.  Without this they sort as third-party.
-known-first-party = ["conftest", "_inspect"]
+known-first-party = ["conftest", "_inspect", "_softhsm"]
 
 [tool.mypy]
 files = ["tests"]
