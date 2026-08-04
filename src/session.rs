@@ -296,11 +296,7 @@ fn find_slot_by_uri(pkcs11: &Pkcs11, slots: &[Slot], uri: &Pkcs11Uri) -> Result<
 }
 
 /// Login-mode-aware slot picker used when the selector doesn't pin a token.
-fn smart_slot_selection(
-    pkcs11: &Pkcs11,
-    slots: &[Slot],
-    login_mode: &LoginMode,
-) -> Result<Slot> {
+fn smart_slot_selection(pkcs11: &Pkcs11, slots: &[Slot], login_mode: &LoginMode) -> Result<Slot> {
     match login_mode {
         // Module-protected: filter out token slots that require login (OCS /
         // softcard). All remaining accelerator-style slots carry the same
