@@ -15,6 +15,10 @@ constraints — see [`NSHIELD.md`](NSHIELD.md).
 ## Features
 
 - Detached OpenPGP signatures (ASCII-armored or binary)
+- Cleartext-signed documents (RFC 9580 Cleartext Signature Framework), the
+  form apt wants for a repository `InRelease`
+- A gpg-CLI-compatible shim so tools that shell out to `gpg` — `rpmsign
+  --addsign` in particular — can sign against the HSM unchanged
 - OpenPGP certificate construction from an HSM-backed public key
 - Two-tier certificates (long-term Certify-only primary + signing subkey)
 - Subkey rotation: re-export with `--merge-cert` to add a new subkey
@@ -164,10 +168,13 @@ flag — that would expose secrets through `ps` and shell history.)
 Omitting both auth flags on a tier means the corresponding key is
 module-protected (no login required).
 
-For day-to-day signing, only the subkey is used and no auth is needed:
+For day-to-day signing, only the subkey is used and no auth is needed.  Point
+`sign` at the published certificate and it takes the subkey's creation time
+from there:
 
 ```sh
-./sq-pkcs11 sign --key-label "openssl-release-sign-2026" openssl-3.6.0.tar.gz
+./sq-pkcs11 sign --key-label "openssl-release-sign-2026" \
+  --input-cert release.asc openssl-3.6.0.tar.gz
 ```
 
 `gpg --verify` walks the cert from the signature's issuer (the subkey)
@@ -266,8 +273,6 @@ merge a new subkey into the wrong cert.
   --creation-time 2026-05-01T00:00:00Z \
   openssl-3.6.0.tar.gz
 # writes openssl-3.6.0.tar.gz.asc
-
-./sq-pkcs11 sign --binary --output release.tar.gz.sig --key-label ... release.tar.gz
 ```
 
 Instead of remembering and passing `--creation-time`, point `sign` at the
@@ -295,6 +300,57 @@ Verify with GnuPG:
 gpg --import release.asc
 gpg --verify openssl-3.6.0.tar.gz.asc openssl-3.6.0.tar.gz
 ```
+
+### Output forms
+
+`sign` emits one of three things.  All three verify with both GnuPG and
+Sequoia:
+
+| Flag | Output | Used by |
+|---|---|---|
+| *(none)* | armored detached signature, `-----BEGIN PGP SIGNATURE-----` | release tarballs, `Release.gpg`, `repomd.xml.asc` |
+| `--binary` | detached signature as raw OpenPGP packets | `rpmsign`, which embeds the packets in the package header |
+| `--cleartext` | the text plus a signature over it, in one document | apt's `InRelease` |
+
+The default is armored, so existing callers are unaffected by the other two.
+
+```sh
+# binary detached — byte-for-byte what `gpg --no-armor -sbo` writes
+./sq-pkcs11 sign --binary \
+  --key-label my-signing-key --input-cert release.asc \
+  --output release.tar.gz.sig release.tar.gz
+```
+
+### Cleartext signing (`InRelease`)
+
+apt accepts a repository `Release` file signed two ways, and normally both are
+published: a detached armored `Release.gpg` (the default output above) and a
+cleartext-signed `InRelease`, which apt prefers because it fetches the metadata
+and its signature in one request.
+
+```sh
+./sq-pkcs11 sign --cleartext \
+  --key-label my-signing-key --input-cert release.asc \
+  --output InRelease Release
+
+gpgv --keyring /etc/apt/trusted.gpg.d/mine.gpg InRelease
+```
+
+`--output` is required with `--cleartext`, and there is no default: a cleartext
+document is a *signed message*, not a detached signature, and letting it land
+on the usual `<input>.asc` path would invite publishing it where a detached
+signature is expected — where every verifier rejects it.
+
+Two properties of the Cleartext Signature Framework are worth knowing before
+publishing one:
+
+- It does not sign trailing whitespace and requires a trailing newline, so
+  line-ending whitespace is trimmed and a missing final newline is added in
+  the emitted copy of the text.  The text in the document is always exactly
+  the text that was signed.  A `Release` file is unaffected by this — its
+  fields carry no trailing whitespace — but a generic input might be.
+- The signature covers the text only.  A verifier must read the message *out of
+  the signed document*, never trust a separate copy of it.
 
 ### Revoking a primary key or subkey
 
@@ -421,31 +477,136 @@ prevents future use without touching the historical record.
 ## Stable fingerprints: `--creation-time`
 
 The OpenPGP fingerprint is derived from key material **and** the key's
-embedded creation time. When `--creation-time` is omitted, the tool
-defaults to Unix epoch (`1970-01-01T00:00:00Z`) — a stable value that
-guarantees `cert-export` and `sign` agree on the fingerprint without any
-coordination.
+embedded creation time. A PKCS#11 token has no notion of an OpenPGP creation
+time, so the value cannot be read off the HSM — it has to be supplied, and it
+has to be the same value every time.
 
-For a published certificate the epoch default is functional but
-unprofessional. Pick a meaningful timestamp **once** when you commit to
-the key, document it, and pass the same value to every subsequent
-invocation:
+**There is no default.** Omitting `--creation-time` is an error on every
+command that needs one. Earlier versions defaulted to Unix epoch, on the
+theory that a fixed placeholder at least kept `cert-export` and `sign` in
+agreement. In practice a caller that passed the flag to `cert-export` and
+forgot it on `sign` got well-formed signatures carrying an issuer fingerprint
+that resolved to no published key — and the failure only surfaced at the
+verifier, as `gpg: Can't check signature: No public key`, after the artifact
+had shipped. Silence is not worth that.
+
+The two ways to supply it:
 
 ```sh
-KEY_TIME=2026-05-01T00:00:00Z
+# 1. Let sign read it out of the published certificate.  Preferred: there is
+#    no timestamp to keep in sync, and it cannot pick the wrong subkey.
+./sq-pkcs11 sign --input-cert release.asc --key-label ... file
 
-./sq-pkcs11 cert-export --creation-time "$KEY_TIME" ...    # once
-./sq-pkcs11 sign        --creation-time "$KEY_TIME" ...    # every time
+# 2. State it.  Required for cert-export, cert-revoke, subkey-revoke and
+#    verify-signing-key, which have no cert to derive it from (or, for
+#    verify-signing-key, deliberately do not derive it).
+KEY_TIME=2026-05-01T00:00:00Z
+./sq-pkcs11 cert-export --creation-time "$KEY_TIME" ...
 ```
 
-Once the certificate is uploaded to keyservers, the timestamp is
-permanent — never change it. A different value gives a different
+Pick the timestamp **once**, when you commit to the key, and document it. The
+natural choice is the moment the HSM generated the key; on nShield that is the
+Security World `gentime`, and [`NSHIELD.md`](NSHIELD.md) has a recipe for
+turning a `CKA_LABEL` into an RFC 3339 timestamp. Once the certificate is
+published the value is permanent — a different one gives a different
 fingerprint, which from a verifier's perspective is a different key.
 
-Better still, once the certificate is published, pass it to `sign` as
-`--input-cert` (see [Signing a file](#signing-a-file)) and skip
-`--creation-time` entirely: the creation time is read back out of the cert by
-matching the HSM key's public material, so the two can never drift.
+If a certificate really was published under the old epoch default, nothing is
+lost: ask for it explicitly and the tool obliges.
+
+```sh
+./sq-pkcs11 sign --creation-time 1970-01-01T00:00:00Z ...
+```
+
+## Signing through a gpg-compatible shim (`rpmsign` and friends)
+
+Some signing tools cannot be pointed at a library; they shell out to a `gpg`
+command line. `rpmsign --addsign` is the common case: it expands rpm's
+`%__gpg_sign_cmd` macro to roughly
+
+```
+gpg --no-verbose --no-armor [--digest-algo=X] -u "<_gpg_name>" -sbo <sigfile> -
+```
+
+and expects the binary to write a binary detached signature to the `-o` path
+and exit 0. [`contrib/sq-pkcs11-gpg-shim`](contrib/sq-pkcs11-gpg-shim) accepts
+that command line and turns it into `sq-pkcs11 sign --binary`.
+
+Point rpm's gpg at the shim and name the HSM key:
+
+```sh
+rpmsign --addsign \
+    --define "_gpg_name <CKA_LABEL>" \
+    --define "__gpg /usr/local/bin/sq-pkcs11-gpg-shim" \
+    package.rpm
+```
+
+Overriding `%__gpg` alone leaves the distro's own `%__gpg_sign_cmd` in place,
+so the contract stays whatever that rpm version expects. Override the whole
+`%__gpg_sign_cmd` only if you need to inject extra arguments. Either macro
+works from the command line, `~/.rpmmacros`, or `/etc/rpm/macros.d/`.
+
+`%_gpg_name` must be the HSM object's `CKA_LABEL` — it becomes `--key-label`,
+not a search over user IDs, so an email address or a fingerprint will not
+resolve.
+
+Everything `sq-pkcs11` needs that gpg has no flag for comes from the
+environment:
+
+| Variable | Effect |
+|---|---|
+| `PKCS11_MODULE_PATH` | vendor PKCS#11 library (required) |
+| `SQ_PKCS11_CERT` | published cert, passed as `--input-cert`; the preferred way to fix the creation time |
+| `SQ_PKCS11_CREATION_TIME` | RFC 3339 creation time, passed as `--creation-time` |
+| `SQ_PKCS11_KEY_LABEL` | supplies the label when the caller passes no `-u`; an explicit `-u` wins |
+| `SQ_PKCS11_PIN_FILE` | passed as `--pin-file`, for a softcard or single-card OCS key |
+| `SQ_PKCS11_BIN` | path to `sq-pkcs11` (default: found on `PATH`) |
+
+One of `SQ_PKCS11_CERT` or `SQ_PKCS11_CREATION_TIME` is required, for the
+reasons in [Stable fingerprints](#stable-fingerprints---creation-time).
+
+The shim removes `SQ_PKCS11_PIN` and `SQ_PKCS11_SUBKEY_PIN` from the
+environment before running `sq-pkcs11`. Those variables switch `sq-pkcs11`
+into PKCS#11 login mode, and a module-protected key — the unattended case —
+needs login mode `None`. A value that merely happens to be exported in a CI
+environment would flip the mode and send key lookup down the
+login-required-token path. Ambient credentials must not steer key selection,
+so `SQ_PKCS11_PIN_FILE` above is the only way in.
+
+`--digest-algo` is accepted and ignored: `sq-pkcs11` picks the digest to match
+the signing key's strength, and the choice is recorded in the signature itself,
+where verifiers read it from. The shim says so on stderr when a caller asks for
+one. Unrecognised options are reported and skipped; options that would change
+what the command *does* (`--verify`, `--encrypt`, key management, …) are
+refused rather than quietly ignored.
+
+`gpg --clearsign` is also supported, and maps to `sign --cleartext` — useful
+for repository tooling that generates `InRelease` through gpg.
+
+### rpm parser compatibility
+
+Two rpm OpenPGP implementations are in play, and they do not agree:
+
+| | rpm 4.16 (EL9, internal parser) | rpm 4.19 (EL10, rpm-sequoia) |
+|---|---|---|
+| RSA | works | works |
+| ECDSA P-256 / P-384 | **rejected** | works |
+
+On EL9, `rpmsign` refuses an ECDSA signature outright (`error: Unsupported PGP
+signature`) and `rpm --import` cannot read an ECDSA certificate (`key 1 import
+failed`). **A packaging key that has to serve both EL9 and EL10 must therefore
+be RSA**, even though `sq-pkcs11` signs happily with either and both verify
+under GnuPG and Sequoia.
+
+One further quirk of rpm 4.16 shapes the `--binary` output. Its subpacket
+parser dispatches on the raw type byte without masking the critical bit
+(`rpmio/rpmpgp.c`), so it cannot read a *critical* signature-creation-time
+subpacket and reports `Signature : RSA/SHA512, Thu Jan  1 00:00:00 1970` for
+every package — verification is unaffected, only the displayed date. `--binary`
+therefore emits that subpacket non-critical, as GnuPG always has. It stays in
+the hashed area, so it is still covered by the signature. The armored and
+cleartext forms are left as Sequoia produces them, since nothing that consumes
+those reads the field through that parser.
 
 ## Supported algorithms
 
@@ -481,6 +642,14 @@ hashes the OpenPGP-formatted data, the digest is wrapped in a DER
 - **No keyserver upload**: the certificate is printed to stdout or
   written to a file; uploading it is left to your existing tooling
   (`gpg --send-keys`, `hkp-tool`, `sq keyring publish`, ...).
+- **The gpg shim only signs**: `contrib/sq-pkcs11-gpg-shim` covers detached
+  and cleartext signing and nothing else.  Verification, encryption, and
+  keyring or key management all need real GnuPG.  It is a compatibility
+  front end for tools that exec `gpg`, not a drop-in replacement.
+- **No signature streaming**: `sign` reads the whole input into memory.  An
+  OpenPGP signature is over a hash of the entire input, so nothing can be
+  emitted before the last byte is read regardless; this only bounds the
+  input size by available memory.
 - **OCS K/N quorum logins are nShield-specific**: handled by wrapping
   the invocation in `preload`, which is part of the nShield Security
   World software and not portable.  On non-nShield HSMs that support
@@ -488,10 +657,13 @@ hashes the OpenPGP-formatted data, the digest is wrapped in a DER
   schemes (Thales/Luna MofN, AWS CloudHSM quorum) need their own
   preload-equivalent or out-of-band auth.
 - **HSM-dependent code is not unit-tested**: the actual signing path,
-  slot/login logic, and certificate assembly require a real HSM. They
-  are exercised by manual integration tests against an nShield 5c. The
-  pure-function code (URI parsing, OID/MPI handling, DigestInfo prefix,
-  timestamp parsing) has unit-test coverage — `cargo test`.
+  slot/login logic, and certificate assembly need a PKCS#11 token, so they
+  are covered by the integration suite in
+  [`tests/`](tests/README.md) rather than by unit
+  tests — run with `pytest` against SoftHSM2 for development and against an
+  nShield for the release-signing pass.  The pure-function code (URI parsing,
+  OID/MPI handling, DigestInfo prefix, timestamp parsing) has unit-test
+  coverage in Rust: `cargo test --bins`.
 
 ## License
 

@@ -197,5 +197,6 @@ exclusions imposed by that mode:
 
 ## See also
 
-- [`tests/nshield/README.md`](tests/nshield/README.md) — provisioning
-  instructions for the unattended integration test suite.
+- [`tests/README.md`](tests/README.md) — the integration test suite: how to
+  provision the nShield test keys, how to run it, and the pre-flight checks
+  that only make sense against the real published certificate.
