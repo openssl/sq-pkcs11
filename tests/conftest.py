@@ -717,6 +717,11 @@ EXEC_TIMEOUT = 300.0
 SETUP_TIMEOUT = 600.0
 
 
+def short_image(image: str) -> str:
+    """`docker.io/library/debian:11` -> `debian:11`, for ids and messages."""
+    return image.rsplit("/", 1)[-1]
+
+
 class Target:
     """A target distribution's own tooling, reachable over `podman exec`."""
 
@@ -724,6 +729,7 @@ class Target:
         self.runtime = runtime
         self.family = family
         self.image = image
+        self.name = short_image(image)
         self.note = note
         self.cid = cid
         # Environment every command in this target gets; populated for rpm
@@ -756,7 +762,7 @@ class Target:
             )
         result = Result(proc, argv)
         if check:
-            assert result.returncode == 0, f"on {self.image}:{result._detail()}"
+            assert result.returncode == 0, f"on {self.name}:{result._detail()}"
         return result
 
     def out(self, command: str, env: dict[str, str] | None = None) -> str:
@@ -774,13 +780,11 @@ class Target:
             capture_output=True,
             timeout=EXEC_TIMEOUT,
         )
-        assert proc.returncode == 0, (
-            f"copying {src} out of {self.image}: {proc.stderr.decode()}"
-        )
+        assert proc.returncode == 0, f"copying {src} out of {self.name}: {proc.stderr.decode()}"
         return dest
 
     def __repr__(self) -> str:
-        return f"<Target {self.image}>"
+        return f"<Target {self.name}>"
 
 
 def _apt_install(package: str) -> str:
@@ -949,7 +953,9 @@ def _remove_container(runtime: str, cid: str) -> None:
 def _target_fixture(targets: Sequence[tuple[str, str, str]], signing: bool = False):
     """A session-scoped fixture parametrized over `targets`."""
 
-    @pytest.fixture(scope="session", params=targets, ids=[image for _, image, _ in targets])
+    @pytest.fixture(
+        scope="session", params=targets, ids=[short_image(image) for _, image, _ in targets]
+    )
     def _fixture(request, container_runtime: str, artifacts: Path):
         family, image, note = request.param
         mounts: list[str] = []
@@ -990,8 +996,8 @@ def _target_fixture(targets: Sequence[tuple[str, str, str]], signing: bool = Fal
 # different command lines, so each signs for itself here.
 rpm_target = _target_fixture(
     [
-        ("rpm", "almalinux:9", "rpm 4.16, internal OpenPGP parser"),
-        ("rpm", "almalinux:10", "rpm 4.19, rpm-sequoia"),
+        ("rpm", "docker.io/library/almalinux:9", "rpm 4.16, internal OpenPGP parser"),
+        ("rpm", "docker.io/library/almalinux:10", "rpm 4.19, rpm-sequoia"),
     ],
     signing=True,
 )
@@ -1001,7 +1007,7 @@ rpm_target = _target_fixture(
 # and nothing about it is implied by either side working in isolation — Debian's
 # rpm 4.20 writes the signature, EL9's rpm 4.16 has to read it.
 deb_signer = _target_fixture(
-    [("deb-rpm", "debian:13", "rpm 4.20 — the signing host's own rpmsign")],
+    [("deb-rpm", "docker.io/library/debian:13", "rpm 4.20 — the signing host's own rpmsign")],
     signing=True,
 )
 
@@ -1009,8 +1015,8 @@ deb_signer = _target_fixture(
 # little; these are where a marginal encoding shows up.
 apt_target = _target_fixture(
     [
-        ("deb", "debian:11", "gpgv 2.2.27"),
-        ("deb", "ubuntu:20.04", "gpgv 2.2.19"),
+        ("deb", "docker.io/library/debian:11", "gpgv 2.2.27"),
+        ("deb", "docker.io/library/ubuntu:20.04", "gpgv 2.2.19"),
     ]
 )
 

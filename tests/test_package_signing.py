@@ -192,7 +192,7 @@ def test_rpmsign_through_the_shim(
     _build(rpm_target)
     result = _sign(rpm_target, pkcs11.rsa, published_cert.name)
     assert result.returncode == 0, (
-        f"rpmsign on {rpm_target.image} ({rpm_target.note}) failed:{result._detail()}"
+        f"rpmsign on {rpm_target.name} ({rpm_target.note}) failed:{result._detail()}"
     )
 
     embedded = _embedded_signature(rpm_target)
@@ -229,7 +229,7 @@ def test_rpm_verifies_the_signature_it_was_given(
     result = rpm_target.run(f"rpm --dbpath /tmp/db -K {PACKAGE}")
     out = result.stdout + result.stderr
     assert result.returncode == 0, (
-        f"{rpm_target.image} ({rpm_target.note}) rejected the signature:\n{out}"
+        f"{rpm_target.name} ({rpm_target.note}) rejected the signature:\n{out}"
     )
     assert "signatures OK" in out, (
         "`digests OK` without `signatures` means the signature was never "
@@ -310,7 +310,7 @@ def test_inrelease_verifies_on_target(apt_target: Target, published_inrelease: P
     result = apt_target.run("gpgv --keyring /artifacts/keyring.gpg /artifacts/InRelease")
     out = result.stdout + result.stderr
     assert result.returncode == 0, (
-        f"gpgv on {apt_target.image} ({apt_target.note}) rejected it:\n{out}"
+        f"gpgv on {apt_target.name} ({apt_target.note}) rejected it:\n{out}"
     )
     assert "Good signature" in out, out
 
@@ -358,7 +358,7 @@ def debian_signed_rpm(
     _build(deb_signer)
     result = _sign(deb_signer, pkcs11.labels[kind], published_certs[kind].name)
     assert result.returncode == 0, (
-        f"rpmsign on {deb_signer.image} failed for {kind}:{result._detail()}"
+        f"rpmsign on {deb_signer.name} failed for {kind}:{result._detail()}"
     )
     embedded = _embedded_signature(deb_signer)
     assert embedded != "(none)", f"Debian's rpm rejected the {kind} signature"
@@ -380,7 +380,7 @@ def test_debian_signed_rpm_on_el_verifier(
 ):
     """Sign on Debian 13, verify on almalinux:9 and almalinux:10."""
     kind, package = debian_signed_rpm
-    expected = VERIFIES[(kind, rpm_target.image)]
+    expected = VERIFIES[(kind, rpm_target.name)]
 
     rpm_target.run("rm -rf /tmp/db && mkdir -p /tmp/db", check=True)
     rpm_target.run("rpm --dbpath /tmp/db --initdb", check=True)
@@ -395,15 +395,15 @@ def test_debian_signed_rpm_on_el_verifier(
 
     if expected:
         assert imported.returncode == 0, (
-            f"{rpm_target.image} could not import the {kind} certificate:{imported._detail()}"
+            f"{rpm_target.name} could not import the {kind} certificate:{imported._detail()}"
         )
         assert ok, (
             f"a {kind} package signed by rpm 4.20 on debian:13 must verify on "
-            f"{rpm_target.image} ({rpm_target.note}), but did not:\n{out}"
+            f"{rpm_target.name} ({rpm_target.note}), but did not:\n{out}"
         )
     else:
         assert not ok, (
-            f"a {kind} package now verifies on {rpm_target.image} "
+            f"a {kind} package now verifies on {rpm_target.name} "
             f"({rpm_target.note}) — that is a change from the recorded matrix, "
             "and would mean the packaging key is no longer restricted to RSA:\n"
             f"{out}"
