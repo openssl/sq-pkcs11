@@ -37,8 +37,8 @@ jobs:
             libssl-dev pkg-config
 
       - name: Install Rust 1.86
-        # Pin to the same MSRV as ci.yml so the released binary is built
-        # by the same toolchain we test against.
+        # Pin to the MSRV declared in Cargo.toml, which ci.yml's `msrv` job also
+        # builds against, so the released binary comes from a toolchain we test.
         run: |
           rustup toolchain install 1.86 --profile minimal
           rustup default 1.86
