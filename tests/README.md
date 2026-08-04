@@ -42,7 +42,7 @@ them. pytest's header prints what was resolved and what was ignored.
 | `SQ_PKCS11_GPG_SHIM` | shim to test. Default: `contrib/sq-pkcs11-gpg-shim` |
 | `SQ_PKCS11_TEST_PIN_FILE` | file holding the token PIN. Set this for SoftHSM2; leave unset for module-protected keys |
 | `SQ_PKCS11_TEST_CONTAINER_MOUNTS` | comma-separated host paths to bind into rpm targets at the same location, each optionally `:ro` (default) or `:rw` — for a module needing more than SoftHSM2 does. nShield wants `/opt/nfast:rw` |
-| `SQ_PKCS11_TEST_CONTAINER_ARGS` | extra arguments for `podman run`, for what a bind mount cannot express. Under rootless podman nShield needs `--userns=keep-id --group-add keep-groups` |
+| `SQ_PKCS11_TEST_CONTAINER_ARGS` | extra arguments for `podman run`, for what a bind mount cannot express. Under rootless podman an nShield wants `--group-add keep-groups`, so the hardserver socket's `nfast` group applies. Not `--userns=keep-id`: that runs the container as your user, and the targets install their own tooling as root |
 | `SQ_PKCS11_TEST_ENV` | a different config file, or `none` to use the environment. Read from the environment itself, since it selects the file |
 
 ### Provisioning the nShield test keys

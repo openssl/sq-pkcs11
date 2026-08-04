@@ -723,9 +723,12 @@ def _start_target(
     argv = [runtime, "run", "-d", "-v", f"{artifacts}:/artifacts:ro"]
     for mount in extra_mounts:
         argv += ["-v", mount]
-    # Whatever else the token needs from the runtime.  `--userns=keep-id` is the
-    # one to reach for under rootless podman: without it the host's uids are
-    # remapped and /opt/nfast, owned by root:nfast, is unreadable inside.
+    # Whatever else the token needs from the runtime.  Under rootless podman an
+    # nShield wants `--group-add keep-groups`, which carries the host's
+    # supplementary groups in so the hardserver socket's `nfast` group applies.
+    # Note what NOT to use: `--userns=keep-id` runs the container as your own
+    # user rather than root, and the targets install their own tooling, so
+    # package installation then fails.
     if extra_mounts:
         argv += shlex.split(CONFIG.get("SQ_PKCS11_TEST_CONTAINER_ARGS", ""))
     argv += [image, "sleep", "infinity"]
@@ -734,7 +737,15 @@ def _start_target(
         pytest.skip(f"could not start {image}: {proc.stderr.strip()}")
     target = Target(runtime, family, image, note, proc.stdout.strip())
     setup = target.run(_TARGET_SETUP[family])
-    assert setup.returncode == 0, f"preparing {image} failed:{setup._detail()}"
+    if setup.returncode != 0:
+        # Preparing a target is environment, not product: a container that
+        # cannot install its own tooling — no network, or not running as root
+        # because SQ_PKCS11_TEST_CONTAINER_ARGS made it someone else — is a
+        # reason to skip with the message, not to fail.  Remove the container
+        # first; the fixture's cleanup has not been armed yet.
+        subprocess.run([runtime, "rm", "-f", target.cid], capture_output=True)
+        detail = (setup.stderr or setup.stdout).strip().splitlines()
+        pytest.skip(f"could not prepare {image}: {detail[-1] if detail else 'no output'}")
     return target
 
 
