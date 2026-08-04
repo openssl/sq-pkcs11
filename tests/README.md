@@ -71,11 +71,11 @@ uv run pytest -m pkcs11
 ### Developing against SoftHSM2
 
 `tests/softhsm.env` is committed, so the development and CI setup is the same
-for everyone. Provision the token once, then select that config:
+for everyone. Selecting it is the whole setup: the token, its PIN file and the
+five keys are created on the first run, under `tests/softhsm/` (gitignored).
 
 ```sh
 sudo apt install softhsm2 opensc          # or: dnf install softhsm opensc
-tests/provision-softhsm.sh                # writes tests/softhsm/, gitignored
 cargo build --release
 
 SQ_PKCS11_TEST_ENV=tests/softhsm.env uv run pytest

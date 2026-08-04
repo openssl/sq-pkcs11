@@ -38,6 +38,7 @@ from uuid import uuid4
 import pytest
 
 import _inspect
+import _softhsm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_ENV_FILE = REPO_ROOT / "tests" / "test.env"
@@ -180,6 +181,26 @@ def _resolve_config() -> tuple[dict[str, str], Path | None, list[str]]:
 CONFIG, CONFIG_SOURCE, CONFIG_NOTES = _resolve_config()
 
 
+def _locate_softhsm_module() -> None:
+    """Point a SoftHSM2 module path at wherever this distribution keeps it.
+
+    Only when the configured path names libsofthsm2.so and is not there: any
+    other module is a vendor library whose absence is a real problem, and must
+    keep skipping with the path the config asked for.  Done at import so the
+    header reports the module the run will actually load.
+    """
+    configured = CONFIG.get("PKCS11_MODULE_PATH", "")
+    if not configured.endswith("libsofthsm2.so") or Path(configured).exists():
+        return
+    found = _softhsm.find_module()
+    if found is not None:
+        CONFIG["PKCS11_MODULE_PATH"] = found
+        CONFIG_NOTES.append(f"PKCS11_MODULE_PATH: {configured} is absent, using {found}")
+
+
+_locate_softhsm_module()
+
+
 def pytest_report_header() -> list[str]:
     """Show what the run actually resolved, so it is never a guess."""
     # relpath rather than relative_to: a config file need not live under the
@@ -304,7 +325,45 @@ class Pkcs11Config:
 
 
 @pytest.fixture(scope="session")
-def pkcs11(sq_pkcs11_bin: Path) -> Pkcs11Config:
+def softhsm_token(request: pytest.FixtureRequest) -> None:
+    """Provision the SoftHSM2 token, when SoftHSM2 is what the config names.
+
+    SOFTHSM2_CONF is that signal: a real HSM's configuration has no such key and
+    this does nothing.  Provisioning belongs here rather than in a script the
+    developer and CI both have to remember to run first — the token, its PIN file
+    and its five keys are all named by the config, so deriving them from it
+    keeps one source of truth for the paths and labels.
+
+    Session-scoped and idempotent, so the cost on a run whose token already
+    exists is one `softhsm2-util --show-slots`.
+    """
+    conf = CONFIG.get("SOFTHSM2_CONF")
+    if not conf:
+        return
+    pin_file = CONFIG.get("SQ_PKCS11_TEST_PIN_FILE")
+    if not pin_file:
+        pytest.skip(
+            "SOFTHSM2_CONF is set but SQ_PKCS11_TEST_PIN_FILE is not, so there is no PIN"
+        )
+    labels = {kind: CONFIG.get(var, "") for kind, var in KEY_VARS.items()}
+    if not all(labels.values()):
+        return  # `pkcs11` reports which ones are missing.
+    module = CONFIG.get("PKCS11_MODULE_PATH") or CONFIG.get("SQ_PKCS11_MODULE", "")
+    try:
+        created = _softhsm.provision(Path(conf), Path(module), labels, Path(pin_file))
+    except _softhsm.Unavailable as exc:
+        pytest.skip(f"SoftHSM2: {exc}")
+    if created:
+        # Through the terminal reporter, not print: creating a token and five
+        # keypairs is worth seeing, and fixture output is otherwise captured and
+        # shown only if something fails.
+        reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_line(f"provisioned SoftHSM2: {', '.join(created)}")
+
+
+@pytest.fixture(scope="session")
+def pkcs11(sq_pkcs11_bin: Path, softhsm_token: None) -> Pkcs11Config:
     """PKCS#11 module + test key labels, verified to actually be present.
 
     Skips — with the reason, not silently — when the module is absent or a

@@ -39,9 +39,6 @@ jobs:
       - name: Run unit tests (release)
         run: cargo test --release --locked --bins
 
-      - name: Provision a SoftHSM2 token
-        run: tests/provision-softhsm.sh
-
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
 
@@ -49,4 +46,3 @@ jobs:
         env:
           SQ_PKCS11_TEST_ENV: tests/softhsm.env
         run: uv run --frozen pytest -v
-
