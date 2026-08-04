@@ -709,6 +709,12 @@ IN_BINARY = "/opt/sq-pkcs11/sq-pkcs11"
 IN_SHIM = "/opt/sq-pkcs11/sq-pkcs11-gpg-shim"
 IN_PIN = "/opt/sq-pkcs11/pin"
 
+# Ceilings for a command in a target.  Generous, because signing waits on an HSM
+# and installing a package waits on a mirror; the point is only that neither can
+# wait forever.
+EXEC_TIMEOUT = 300.0
+SETUP_TIMEOUT = 600.0
+
 
 class Target:
     """A target distribution's own tooling, reachable over `podman exec`."""
@@ -724,13 +730,29 @@ class Target:
         self.env: dict[str, str] = {}
 
     def run(
-        self, command: str, check: bool = False, env: dict[str, str] | None = None
+        self,
+        command: str,
+        check: bool = False,
+        env: dict[str, str] | None = None,
+        timeout: float = EXEC_TIMEOUT,
     ) -> Result:
         argv = [self.runtime, "exec"]
         for name, value in {**self.env, **(env or {})}.items():
             argv += ["--env", f"{name}={value}"]
         argv += [self.cid, "bash", "-c", command]
-        proc = subprocess.run(argv, capture_output=True)
+        try:
+            proc = subprocess.run(argv, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as expired:
+            # Bounded, because a container command can wait forever: a package
+            # manager whose mirror accepts the connection and then stalls, or
+            # anything that turns out to want input.  A test that reports a
+            # timeout can be diagnosed; a session that hangs cannot.
+            proc = subprocess.CompletedProcess(
+                argv,
+                124,  # what `timeout(1)` reports, for the same reason
+                expired.stdout or b"",
+                (expired.stderr or b"") + f"timed out after {timeout:g}s".encode(),
+            )
         result = Result(proc, argv)
         if check:
             assert result.returncode == 0, f"on {self.image}:{result._detail()}"
@@ -747,7 +769,9 @@ class Target:
         are different machines running different distributions.
         """
         proc = subprocess.run(
-            [self.runtime, "cp", f"{self.cid}:{src}", str(dest)], capture_output=True
+            [self.runtime, "cp", f"{self.cid}:{src}", str(dest)],
+            capture_output=True,
+            timeout=EXEC_TIMEOUT,
         )
         assert proc.returncode == 0, (
             f"copying {src} out of {self.image}: {proc.stderr.decode()}"
@@ -758,22 +782,34 @@ class Target:
         return f"<Target {self.image}>"
 
 
-# Prerequisites each family needs.  The rpm images already have rpm and
-# rpm-build; the deb images need gpgv.
+def _apt_install(package: str) -> str:
+    """Install one package, without waiting on a mirror that never answers.
+
+    The Acquire options matter on a restricted network: apt's default is a long
+    timeout and several retries per URI, so an unreachable archive costs minutes
+    per index file before failing.
+    """
+    return (
+        "{ export DEBIAN_FRONTEND=noninteractive; "
+        "apt-get update -qq -o Acquire::Retries=1 -o Acquire::http::Timeout=20 "
+        "-o Acquire::https::Timeout=20 && "
+        f"apt-get install -y -qq --no-install-recommends {package}; }}"
+    )
+
+
+# Prerequisites each family needs, each guarded on what it installs: a base
+# image that already has the tool must not reach for the network, because
+# `apt-get update` against an archived release is exactly where a run on a
+# restricted network stalls.  Output is left alone rather than redirected to
+# /dev/null — it is captured either way, and it is what the skip message says.
 _TARGET_SETUP = {
     "rpm": "command -v rpmbuild >/dev/null || dnf install -y -q rpm-build rpm-sign",
+    # The deb images ship gpgv already: apt depends on it to verify a Release
+    # file, which is the very thing being tested here.
+    "deb": "command -v gpgv >/dev/null || " + _apt_install("gpgv"),
     # Debian's `rpm` package carries rpmbuild and rpmsign.  This is what the
     # signing host runs, so it is the signer in the production-topology test.
-    "deb-rpm": (
-        "set -e; export DEBIAN_FRONTEND=noninteractive; "
-        "apt-get update -qq >/dev/null 2>&1; "
-        "apt-get install -y -qq --no-install-recommends rpm >/dev/null 2>&1"
-    ),
-    "deb": (
-        "set -e; export DEBIAN_FRONTEND=noninteractive; "
-        "apt-get update -qq >/dev/null 2>&1; "
-        "apt-get install -y -qq --no-install-recommends gpgv >/dev/null 2>&1"
-    ),
+    "deb-rpm": "command -v rpmsign >/dev/null || " + _apt_install("rpm"),
 }
 
 
@@ -882,12 +918,16 @@ def _start_target(
     if extra_mounts:
         argv += shlex.split(CONFIG.get("SQ_PKCS11_TEST_CONTAINER_ARGS", ""))
     argv += [image, "sleep", "infinity"]
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    try:
+        # Bounded: this pulls the image when it is not local yet.
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=SETUP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pytest.skip(f"starting {image} timed out after {SETUP_TIMEOUT:g}s (slow image pull?)")
     if proc.returncode != 0:
         pytest.skip(f"could not start {image}: {proc.stderr.strip()}")
     target = Target(runtime, family, image, note, proc.stdout.strip())
     _STARTED.add((runtime, target.cid))
-    setup = target.run(_TARGET_SETUP[family])
+    setup = target.run(_TARGET_SETUP[family], timeout=SETUP_TIMEOUT)
     if setup.returncode != 0:
         # Preparing a target is environment, not product: a container that
         # cannot install its own tooling — no network, or not running as root
