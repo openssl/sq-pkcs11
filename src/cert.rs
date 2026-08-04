@@ -409,6 +409,65 @@ pub fn creation_time_of_matching_key(
 }
 
 // ---------------------------------------------------------------------------
+// Signature template helpers
+// ---------------------------------------------------------------------------
+
+/// Pin a signature's creation time into the hashed area **without** the
+/// critical bit, the way GnuPG encodes it.
+///
+/// Used only on the `--binary` detached path, which is the only output form
+/// rpm consumes.  Armored detached signatures and cleartext documents stay on
+/// Sequoia's streaming signer — it re-stamps this subpacket critical after
+/// applying the template, and there is no reason to take new code into the
+/// release-tarball and git-tag signing paths for a problem their consumers
+/// do not have.
+///
+/// Sequoia marks the signature-creation-time subpacket critical, which is
+/// legal — but rpm's own OpenPGP parser up to and including 4.16 (EL9,
+/// `rpmio/rpmpgp.c`) dispatches on the raw subpacket-type byte:
+///
+/// ```text
+/// switch (*p) {
+/// case PGPSUBTYPE_SIG_CREATE_TIME:   /* 2 */
+/// ```
+///
+/// With the critical bit set the byte is 0x82, no case matches, and rpm never
+/// records the time.  A package signed that way still verifies — `rpm -K`
+/// reports "digests signatures OK", because verification re-hashes the
+/// subpacket area verbatim — but `rpm -qi` reports
+/// `Signature : RSA/SHA512, Thu Jan  1 00:00:00 1970` for every package in the
+/// repository.
+///
+/// The critical bit only instructs a verifier to reject signatures carrying
+/// subpackets it does not understand.  Every implementation understands the
+/// creation time — RFC 9580 §5.2.3.11 requires it to be present — so marking
+/// it critical buys nothing, and GnuPG has never done so.  The subpacket stays
+/// in the hashed area either way, so it remains covered by the signature.
+pub fn with_noncritical_creation_time(
+    builder: SignatureBuilder,
+    creation_time: std::time::SystemTime,
+) -> Result<SignatureBuilder> {
+    use sequoia_openpgp::packet::signature::subpacket::{Subpacket, SubpacketValue};
+    use sequoia_openpgp::types::Timestamp;
+
+    let stamp = Timestamp::try_from(creation_time)
+        .map_err(|e| Error::Other(anyhow::anyhow!("signature creation time {e}")))?;
+
+    // Going through the setter first is what stops Sequoia from re-adding its
+    // own critical copy while signing: it flips the builder's internal
+    // "creation time was overridden" flag, which the sign path checks.
+    let mut builder = builder.set_signature_creation_time(stamp)?;
+    builder
+        .hashed_area_mut()
+        .replace(Subpacket::new(
+            SubpacketValue::SignatureCreationTime(stamp),
+            false,
+        )?)
+        .map_err(|e| Error::Other(anyhow::anyhow!("replacing creation-time subpacket: {e}")))?;
+    Ok(builder)
+}
+
+// ---------------------------------------------------------------------------
 // Hash algorithm helpers
 // ---------------------------------------------------------------------------
 
@@ -527,6 +586,70 @@ mod tests {
             ppr = next;
         }
         assert_eq!(count, 1, "expected exactly one packet, got {count}");
+    }
+
+    // -------------------------------------------------------------------
+    // with_noncritical_creation_time
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn creation_time_subpacket_is_hashed_but_not_critical() {
+        use sequoia_openpgp::packet::signature::subpacket::SubpacketTag;
+
+        // The key has to predate the signature or Sequoia rejects it on
+        // verification, so pin both times.
+        let key_time = humantime::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        let (cert, _rev) = CertBuilder::new()
+            .set_cipher_suite(CipherSuite::P256)
+            .set_creation_time(key_time)
+            .add_userid("Subpacket Test <sp@example.com>")
+            .generate()
+            .expect("software cert");
+        let mut keypair = cert
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .expect("secret")
+            .into_keypair()
+            .expect("keypair");
+
+        let t = humantime::parse_rfc3339("2026-05-26T15:08:47Z").unwrap();
+        let builder =
+            SignatureBuilder::new(SignatureType::Binary).set_hash_algo(HashAlgorithm::SHA256);
+        let sig = with_noncritical_creation_time(builder, t)
+            .expect("re-encode creation time")
+            .sign_message(&mut keypair, b"payload")
+            .expect("sign");
+
+        // Exactly one creation-time subpacket, and it lives in the hashed
+        // (signed) area — dropping the critical bit must not move it.
+        let hashed: Vec<_> = sig
+            .hashed_area()
+            .iter()
+            .filter(|sp| sp.tag() == SubpacketTag::SignatureCreationTime)
+            .collect();
+        assert_eq!(
+            hashed.len(),
+            1,
+            "expected one hashed creation-time subpacket"
+        );
+        assert!(
+            !hashed[0].critical(),
+            "creation-time subpacket must not be critical: rpm 4.16 switches on the \
+             raw type byte and silently misses 0x82, reporting a 1970 signature date"
+        );
+        assert_eq!(
+            sig.unhashed_area()
+                .iter()
+                .filter(|sp| sp.tag() == SubpacketTag::SignatureCreationTime)
+                .count(),
+            0,
+            "creation time must never end up in the unhashed (unsigned) area"
+        );
+        assert_eq!(sig.signature_creation_time(), Some(t));
+        sig.verify_message(keypair.public(), b"payload")
+            .expect("signature must still verify");
     }
 
     // -------------------------------------------------------------------

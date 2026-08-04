@@ -174,8 +174,30 @@ struct SignArgs {
 
     /// Produce binary signature instead of ASCII-armored.
     /// (Default output is ASCII-armored, matching GnuPG and Sequoia conventions.)
-    #[arg(long)]
+    ///
+    /// Binary detached signatures are what `gpg --no-armor -sbo` produces and
+    /// what `rpmsign --addsign` embeds verbatim in a package header.
+    #[arg(long, conflicts_with = "cleartext")]
     binary: bool,
+
+    /// Emit an OpenPGP Cleartext Signature Framework document (RFC 9580 §7)
+    /// instead of a detached signature: the input text, followed by an
+    /// armored signature over it, in one file.
+    ///
+    /// This is the form `gpg --clearsign` produces, and the form apt prefers
+    /// for a repository's `InRelease` file.
+    ///
+    /// `--output` is mandatory here.  A cleartext document is a *signed
+    /// message*, not a detached signature, so writing it to the usual
+    /// `<input>.asc` default would invite publishing it where a detached
+    /// signature is expected — where every verifier would reject it.
+    ///
+    /// The framework does not sign trailing whitespace and requires a final
+    /// newline, so line-ending whitespace is trimmed and a missing final
+    /// newline added in the emitted copy of the text; the emitted text is
+    /// exactly what was signed.
+    #[arg(long, requires = "output")]
+    cleartext: bool,
 
     /// Overwrite the output file if it already exists.  Without this flag,
     /// sq-pkcs11 refuses to overwrite an existing file — protects against
@@ -192,8 +214,9 @@ struct SignArgs {
     /// Precedence: an explicit --creation-time always wins (and warns if it
     /// disagrees with the matching key in --input-cert).  Otherwise, if
     /// --input-cert is given the creation time is derived from the cert.
-    /// Otherwise it defaults to Unix epoch — use this default consistently
-    /// only if you did not pass --creation-time during cert-export either.
+    /// Supplying neither is an error — there is no default, because a wrong
+    /// creation time yields a wrong issuer fingerprint and thus a signature
+    /// no verifier can attribute to the published certificate.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
 
@@ -266,12 +289,13 @@ struct CertExportArgs {
     force: bool,
 
     /// Key creation time to embed in the certificate (RFC 3339,
-    /// e.g. 2026-04-30T16:29:30Z).
+    /// e.g. 2026-04-30T16:29:30Z).  Required.
     ///
     /// The OpenPGP fingerprint is derived from key material + creation time,
     /// so this value must be used consistently in every subsequent `sign`
-    /// invocation.  Defaults to Unix epoch when omitted, which is a stable
-    /// value that requires no coordination between cert-export and sign.
+    /// invocation.  There is no default: a certificate published with an
+    /// accidental placeholder timestamp is permanent, because changing it
+    /// changes the fingerprint and so, to every verifier, the key.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
 
@@ -391,8 +415,9 @@ struct CertRevokeArgs {
     auth: AuthArgs,
 
     /// Primary key creation time used to derive the OpenPGP fingerprint.
-    /// Must match the value used during cert-export so the revocation
-    /// targets the right key.  Defaults to Unix epoch.
+    /// Required, and must match the value used during cert-export so the
+    /// revocation targets the right key — a revocation aimed at a
+    /// fingerprint nobody has is silently useless.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
 
@@ -431,7 +456,7 @@ struct SubkeyRevokeArgs {
     #[command(flatten)]
     auth: AuthArgs,
 
-    /// Primary key creation time (RFC 3339).
+    /// Primary key creation time (RFC 3339).  Required — see cert-revoke.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
 
@@ -510,6 +535,11 @@ struct VerifySigningKeyArgs {
 
     /// Key creation time (RFC 3339) used to derive the OpenPGP fingerprint
     /// of the HSM key — same semantics as in cert-export and sign.
+    ///
+    /// Required, and deliberately never derived from --input-cert: this
+    /// command exists to check that HSM key + declared creation time really
+    /// is a live signer in the cert.  Reading the timestamp out of the same
+    /// cert would make the check pass by construction.
     #[arg(long, value_name = "TIMESTAMP")]
     creation_time: Option<String>,
 
@@ -673,17 +703,71 @@ fn parse_validity(s: &str, creation: std::time::SystemTime) -> anyhow::Result<st
     Ok(dur)
 }
 
-/// Parse an optional RFC 3339 timestamp, defaulting to Unix epoch.
+/// Parse an RFC 3339 timestamp supplied for `flag`, naming the flag in the
+/// error so a bad `--revocation-time` doesn't report itself as a bad
+/// `--creation-time`.
+fn parse_rfc3339_time(flag: &str, ts: &str) -> anyhow::Result<std::time::SystemTime> {
+    humantime::parse_rfc3339(ts)
+        .with_context(|| format!("invalid {flag} {ts:?}; use RFC 3339, e.g. 2026-04-30T16:29:30Z"))
+}
+
+/// Resolve a **mandatory** OpenPGP key-creation time.
 ///
-/// Unix epoch as default means the fingerprint is stable across runs without
-/// requiring the user to remember and pass a specific timestamp.
-fn parse_creation_time(s: Option<&str>) -> anyhow::Result<std::time::SystemTime> {
-    match s {
-        None => Ok(std::time::SystemTime::UNIX_EPOCH),
-        Some(ts) => humantime::parse_rfc3339(ts).with_context(|| {
-            format!("invalid --creation-time {ts:?}; use RFC 3339, e.g. 2026-04-30T16:29:30Z")
-        }),
+/// This used to default to `SystemTime::UNIX_EPOCH` when the flag was
+/// omitted.  That default was silent and, in the field, wrong: an OpenPGP
+/// fingerprint hashes the creation time along with the key material, so a
+/// forgotten flag produced real, well-formed signatures carrying an issuer
+/// fingerprint that resolves to no published key.  Verification fails with
+/// "no public key" — far away from the actual cause, and only after the
+/// artefact has shipped.
+///
+/// A missing timestamp is therefore an error.  Callers that genuinely want
+/// the historical behaviour ask for it in full: `--creation-time
+/// 1970-01-01T00:00:00Z`.  No opt-in flag is needed for that, and spelling
+/// the epoch out leaves the intent in the caller's command line.
+fn require_creation_time(
+    supplied: Option<&str>,
+    flag: &str,
+    derive_hint: Option<&str>,
+) -> anyhow::Result<std::time::SystemTime> {
+    match supplied {
+        Some(ts) => parse_rfc3339_time(flag, ts),
+        None => Err(missing_creation_time(flag, derive_hint)),
     }
+}
+
+/// The diagnostic for an omitted key-creation time.
+///
+/// Deliberately long: the value cannot be discovered from the HSM (PKCS#11
+/// has no notion of an OpenPGP creation time), so an operator who hits this
+/// needs to be told where to go and get it.  `derive_hint` carries the
+/// per-command shortcut, if the command has one.
+fn missing_creation_time(flag: &str, derive_hint: Option<&str>) -> anyhow::Error {
+    let hint = match derive_hint {
+        Some(h) => format!("\n{h}\n"),
+        None => String::new(),
+    };
+    anyhow::anyhow!(
+        "\
+{flag} is required.
+
+An OpenPGP fingerprint is a hash over the public key material *and* the key's
+creation time, so this timestamp decides the issuer fingerprint embedded in
+whatever is signed.  A PKCS#11 token has no notion of an OpenPGP creation
+time, so it cannot be read back off the HSM.
+
+Supply the time the key was generated on the HSM, converted to UTC.  On
+nShield that is the Security World `gentime` — see NSHIELD.md, \"Reading the
+key generation time from the Security World\", which has a CKA_LABEL-to-RFC
+3339 recipe.  The value must equal the creation time the published
+certificate embeds for this key.
+{hint}
+Earlier versions of this tool defaulted to 1970-01-01T00:00:00Z here.  That
+silently produced signatures whose issuer fingerprint no verifier could
+resolve against the published certificate.  If a certificate really was
+published with that default, ask for it explicitly:
+`{flag} 1970-01-01T00:00:00Z`."
+    )
 }
 
 /// Refuse to clobber an existing output file *before* any HSM round
@@ -779,13 +863,30 @@ fn resolve_module(from_cli: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode()?;
+
+    // The creation time has to come from somewhere: either stated outright,
+    // or read out of a published cert.  Reject "neither" up front, before any
+    // HSM round-trip, rather than falling back to a placeholder that would
+    // produce a correctly-signed artefact attributed to a key nobody has.
+    if args.creation_time.is_none() && args.input_cert.is_none() {
+        return Err(missing_creation_time(
+            "--creation-time",
+            Some(
+                "Or skip the timestamp entirely and pass `--input-cert <CERT>`: sign then\n\
+                 locates the key in that certificate by matching the HSM key's public\n\
+                 material and reuses its creation time, so the issuer fingerprint matches\n\
+                 the published key by construction.  This is the preferred form.",
+            ),
+        ));
+    }
+
     // An explicit --creation-time, parsed now so a malformed timestamp fails
-    // before any HSM round-trip.  `None` here means "not supplied" (distinct
-    // from the epoch default applied later), which the precedence logic needs.
+    // before any HSM round-trip.  `None` here means "not supplied", which the
+    // precedence logic below needs to distinguish from a supplied value.
     let explicit_creation_time = args
         .creation_time
         .as_deref()
-        .map(|s| parse_creation_time(Some(s)))
+        .map(|s| parse_rfc3339_time("--creation-time", s))
         .transpose()?;
 
     // Resolve the output path first, then preflight the overwrite check
@@ -828,8 +929,8 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
     // Determine the OpenPGP key-creation time to sign with, by precedence:
     //   1. explicit --creation-time wins (warn if it disagrees with the
     //      matching key in --input-cert);
-    //   2. else derive from --input-cert by matching public material;
-    //   3. else fall back to the Unix-epoch default for backward compat.
+    //   2. else derive from --input-cert by matching public material.
+    // "Neither supplied" was rejected in the preflight above.
     // `signer.public_key()` carries the HSM key's material; its (epoch)
     // creation time here is irrelevant to matching, which is material-only.
     let creation_time = match (explicit_creation_time, &input_cert) {
@@ -849,7 +950,7 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
         }
         (Some(explicit), None) => explicit,
         (None, Some(cert)) => cert::creation_time_of_matching_key(cert, signer.public_key())?,
-        (None, None) => std::time::SystemTime::UNIX_EPOCH,
+        (None, None) => unreachable!("the preflight above rejects both being absent"),
     };
     signer.set_creation_time(creation_time)?;
 
@@ -860,36 +961,84 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
     let data =
         std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
 
-    let mut sig_buf = Vec::new();
-    {
-        let sink = Message::new(&mut sig_buf);
-        // Armorer defaults to Kind::Message which would emit
-        // `-----BEGIN PGP MESSAGE-----`.  A detached signature must be
-        // wrapped in Kind::Signature so verifiers (and `sq inspect`) see
-        // `-----BEGIN PGP SIGNATURE-----` and treat the bytes as a
-        // standalone signature rather than an OpenPGP message.
-        let sink = if args.binary {
-            sink
-        } else {
-            Armorer::new(sink).kind(armor::Kind::Signature).build()?
-        };
-        let template = SignatureBuilder::new(SignatureType::Binary).set_hash_algo(hash_algo);
-        let mut signing_stream = Signer::with_template(sink, signer, template)?
-            .detached()
-            .build()?;
-        signing_stream.write_all(&data)?;
-        signing_stream.finalize()?;
-    }
+    // Only the --binary path departs from the streaming signer, so only it
+    // needs the signature's own creation time pinned up front.  See that
+    // branch, and cert::with_noncritical_creation_time.
+    let sig_buf = if args.cleartext {
+        // Cleartext Signature Framework: Sequoia's streaming signer emits the
+        // whole document — `-----BEGIN PGP SIGNED MESSAGE-----`, the Hash
+        // header, the dash-escaped text, then the armored signature.  It must
+        // NOT be wrapped in an Armorer (that would armor the armor), and it
+        // forces SignatureType::Text internally; we state Text in the template
+        // too so the code reads the way the output does.
+        let mut buf = Vec::new();
+        {
+            let sink = Message::new(&mut buf);
+            let template = SignatureBuilder::new(SignatureType::Text).set_hash_algo(hash_algo);
+            let mut signing_stream = Signer::with_template(sink, signer, template)?
+                .cleartext()
+                .build()?;
+            signing_stream.write_all(&data)?;
+            signing_stream.finalize()?;
+        }
+        buf
+    } else if args.binary {
+        // A detached signature is exactly one Signature packet over the data,
+        // so build it from the template directly instead of streaming.  The
+        // streaming path calls set_signature_creation_time() itself after
+        // cloning the template (serialize::stream, emit_signatures), which
+        // re-marks that subpacket critical — and rpm's own parser, through
+        // 4.16, cannot read it in that form.  See
+        // cert::with_noncritical_creation_time.
+        //
+        // This is deliberately scoped to --binary, the only form rpm consumes.
+        // The armored branch below is left on the streaming signer so that the
+        // signatures over release tarballs and git tags keep running through
+        // exactly the code that produced them before, byte-shape and all; no
+        // consumer of those reads the creation time through a parser that gets
+        // the critical bit wrong.  Nothing is lost by not streaming here: the
+        // input is already in memory, and a signature cannot be emitted before
+        // its last byte has been hashed anyway.
+        let template = cert::with_noncritical_creation_time(
+            SignatureBuilder::new(SignatureType::Binary).set_hash_algo(hash_algo),
+            std::time::SystemTime::now(),
+        )?;
+        let sig = template.sign_message(&mut signer, &data)?;
+        cert::export_binary_signature(&sig)?
+    } else {
+        let mut buf = Vec::new();
+        {
+            let sink = Message::new(&mut buf);
+            // Armorer defaults to Kind::Message which would emit
+            // `-----BEGIN PGP MESSAGE-----`.  A detached signature must be
+            // wrapped in Kind::Signature so verifiers (and `sq inspect`) see
+            // `-----BEGIN PGP SIGNATURE-----` and treat the bytes as a
+            // standalone signature rather than an OpenPGP message.
+            let sink = Armorer::new(sink).kind(armor::Kind::Signature).build()?;
+            let template = SignatureBuilder::new(SignatureType::Binary).set_hash_algo(hash_algo);
+            let mut signing_stream = Signer::with_template(sink, signer, template)?
+                .detached()
+                .build()?;
+            signing_stream.write_all(&data)?;
+            signing_stream.finalize()?;
+        }
+        buf
+    };
 
+    let what = if args.cleartext {
+        "Cleartext-signed message"
+    } else {
+        "Signature"
+    };
     match output_target {
         SignOutput::Stdout => {
             std::io::stdout()
                 .write_all(&sig_buf)
-                .context("writing signature to stdout")?;
+                .with_context(|| format!("writing {} to stdout", what.to_lowercase()))?;
         }
         SignOutput::File(sig_path) => {
             write_or_refuse(&sig_path, &sig_buf, args.force)?;
-            eprintln!("Signature written to {}", sig_path.display());
+            eprintln!("{what} written to {}", sig_path.display());
         }
     }
     Ok(())
@@ -914,7 +1063,15 @@ fn cmd_cert_export(pkcs11: &Pkcs11, args: CertExportArgs) -> anyhow::Result<()> 
     // ── Primary tier ─────────────────────────────────────────────────
     let primary_selector = args.key.resolve()?;
     let primary_login = args.auth.login_mode()?;
-    let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let primary_creation_time = require_creation_time(
+        args.creation_time.as_deref(),
+        "--creation-time",
+        Some(
+            "For a rotation with --merge-cert this is the *existing* primary's creation\n\
+             time: the primary fingerprint is the certificate's identity, and the merge is\n\
+             refused outright if the two disagree.",
+        ),
+    )?;
     let primary_validity = if args.no_expiration {
         None
     } else {
@@ -936,7 +1093,15 @@ fn cmd_cert_export(pkcs11: &Pkcs11, args: CertExportArgs) -> anyhow::Result<()> 
 
     if let Some(sel) = &subkey_selector {
         let subkey_login = build_subkey_login(&args)?;
-        subkey_creation_time = parse_creation_time(args.subkey_creation_time.as_deref())?;
+        subkey_creation_time = require_creation_time(
+            args.subkey_creation_time.as_deref(),
+            "--subkey-creation-time",
+            Some(
+                "This is the new signing subkey's own creation time — the one every later\n\
+                 `sign --creation-time` for that subkey has to repeat.  It is independent of\n\
+                 the primary's, and for a rotation it is usually the cut-over date.",
+            ),
+        )?;
         subkey_validity = if args.subkey_no_expiration {
             None
         } else {
@@ -1017,9 +1182,13 @@ fn cmd_cert_revoke(pkcs11: &Pkcs11, args: CertRevokeArgs) -> anyhow::Result<()> 
 
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode()?;
-    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let creation_time = require_creation_time(
+        args.creation_time.as_deref(),
+        "--creation-time",
+        Some("This is the *primary* key's creation time, as published in the certificate."),
+    )?;
     let revocation_time = match args.revocation_time.as_deref() {
-        Some(s) => parse_creation_time(Some(s))?,
+        Some(s) => parse_rfc3339_time("--revocation-time", s)?,
         None => std::time::SystemTime::now(),
     };
 
@@ -1049,9 +1218,16 @@ fn cmd_cert_revoke(pkcs11: &Pkcs11, args: CertRevokeArgs) -> anyhow::Result<()> 
 fn cmd_subkey_revoke(pkcs11: &Pkcs11, args: SubkeyRevokeArgs) -> anyhow::Result<()> {
     let primary_selector = args.key.resolve()?;
     let primary_login = args.auth.login_mode()?;
-    let primary_creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let primary_creation_time = require_creation_time(
+        args.creation_time.as_deref(),
+        "--creation-time",
+        Some(
+            "This is the *primary* key's creation time — the subkey being revoked is\n\
+             identified by --subkey-fingerprint out of --input-cert, not by a timestamp.",
+        ),
+    )?;
     let revocation_time = match args.revocation_time.as_deref() {
-        Some(s) => parse_creation_time(Some(s))?,
+        Some(s) => parse_rfc3339_time("--revocation-time", s)?,
         None => std::time::SystemTime::now(),
     };
 
@@ -1200,9 +1376,16 @@ fn cmd_verify_signing_key(pkcs11: &Pkcs11, args: VerifySigningKeyArgs) -> anyhow
 
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode()?;
-    let creation_time = parse_creation_time(args.creation_time.as_deref())?;
+    let creation_time = require_creation_time(
+        args.creation_time.as_deref(),
+        "--creation-time",
+        Some(
+            "Pass the same value the matching `sign` invocation will use — checking a\n\
+             different timestamp than you sign with tells you nothing.",
+        ),
+    )?;
     let at_time = match args.at_time.as_deref() {
-        Some(s) => parse_creation_time(Some(s))?,
+        Some(s) => parse_rfc3339_time("--at-time", s)?,
         None => std::time::SystemTime::now(),
     };
 
@@ -1441,24 +1624,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creation_time_default_is_epoch() {
-        assert_eq!(
-            parse_creation_time(None).unwrap(),
-            std::time::SystemTime::UNIX_EPOCH
+    fn creation_time_omitted_is_an_error_not_epoch() {
+        // Regression guard for the silent Unix-epoch default: a forgotten
+        // --creation-time produced perfectly valid signatures carrying an
+        // issuer fingerprint that resolved to no published key.
+        let err = require_creation_time(None, "--creation-time", None)
+            .expect_err("an omitted creation time must be rejected")
+            .to_string();
+        assert!(
+            err.contains("--creation-time is required"),
+            "error must name the missing flag, got: {err}"
+        );
+        assert!(
+            err.contains("gentime"),
+            "error must say where the value comes from, got: {err}"
+        );
+        assert!(
+            err.contains("1970-01-01T00:00:00Z"),
+            "error must spell out the explicit opt-in for the old behaviour, got: {err}"
         );
     }
 
     #[test]
+    fn missing_creation_time_names_the_flag_it_was_asked_about() {
+        // cert-export has two independent creation times; each must report
+        // itself, not a generic message.
+        let err = require_creation_time(None, "--subkey-creation-time", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("--subkey-creation-time is required"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`--subkey-creation-time 1970-01-01T00:00:00Z`"),
+            "the opt-in example must use the same flag, got: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_creation_time_includes_the_per_command_hint() {
+        let err = require_creation_time(None, "--creation-time", Some("HINT-MARKER"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HINT-MARKER"), "{err}");
+    }
+
+    #[test]
     fn creation_time_rfc3339_round_trip() {
-        let t = parse_creation_time(Some("2026-04-30T16:29:30Z")).unwrap();
+        let t =
+            require_creation_time(Some("2026-04-30T16:29:30Z"), "--creation-time", None).unwrap();
         let expected = humantime::parse_rfc3339("2026-04-30T16:29:30Z").unwrap();
         assert_eq!(t, expected);
     }
 
     #[test]
+    fn creation_time_epoch_is_still_accepted_when_explicit() {
+        // The escape hatch for a cert that really was published with the old
+        // default: spell the epoch out.
+        let t =
+            require_creation_time(Some("1970-01-01T00:00:00Z"), "--creation-time", None).unwrap();
+        assert_eq!(t, std::time::SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
     fn creation_time_garbage_rejected() {
-        assert!(parse_creation_time(Some("not a date")).is_err());
-        assert!(parse_creation_time(Some("")).is_err());
+        assert!(parse_rfc3339_time("--creation-time", "not a date").is_err());
+        assert!(parse_rfc3339_time("--creation-time", "").is_err());
+    }
+
+    #[test]
+    fn timestamp_error_names_the_flag_that_was_malformed() {
+        // A bad --revocation-time used to report itself as a bad
+        // --creation-time, sending the operator to the wrong flag.
+        let err = parse_rfc3339_time("--revocation-time", "not a date")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--revocation-time"), "{err}");
     }
 
     #[test]
@@ -1467,7 +1709,7 @@ mod tests {
         // or an offset is ambiguous and must be rejected so users don't
         // accidentally embed a localtime-interpreted timestamp in a published
         // certificate.
-        assert!(parse_creation_time(Some("2026-04-30T16:29:30")).is_err());
+        assert!(parse_rfc3339_time("--creation-time", "2026-04-30T16:29:30").is_err());
     }
 
     #[test]
