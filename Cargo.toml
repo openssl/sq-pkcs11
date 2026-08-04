@@ -47,12 +47,6 @@ humantime = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# CLI integration test scaffolding
-assert_cmd = "2"
-tempfile   = "3"
-dotenvy    = "0.15"
-
-# Strict OpenPGP packet parsing for integration-test assertions on cert-revoke
-# and subkey-revoke output. Same crate + features as [dependencies], so Cargo
-# unifies the build.
-sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-openssl"] }
+# Unit tests in src/ only need the crate itself.  The integration suite that
+# drives the compiled binary lives in tests/ and is run with pytest — see
+# pyproject.toml and tests/README.md.

@@ -1,0 +1,90 @@
+# Python environment for the integration test suite.
+#
+# The suite drives the compiled `sq-pkcs11` binary and the `contrib/`
+# gpg shim as subprocesses; it is not a Python package and nothing here is
+# needed to build or run sq-pkcs11 itself.
+#
+#   uv run pytest -m hermetic            # no HSM, no containers
+#   uv run pytest                        # everything the host can support
+#
+# `uv sync` needs network access once.  On a host without it — the HSM client,
+# typically — install pytest from the distro instead (`apt install python3-pytest`,
+# `dnf install python3-pytest`) and run `python3 -m pytest`: the suite uses only
+# the standard library plus pytest itself, with no plugins.
+
+[project]
+name = "sq-pkcs11-tests"
+version = "0.0.0"
+description = "Integration test suite for the sq-pkcs11 CLI"
+# 3.9 is the floor because EL9 ships Python 3.9 and the rpm-facing tests want
+# to be runnable there.
+requires-python = ">=3.9"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.14", "mypy>=1.14"]
+
+# Not an installable package — there is no Python source to build, only tests.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra surfaces the skip reasons, which is the whole point of the marker
+# scheme: a run that skips everything should say why, loudly.
+addopts = "-ra --strict-markers"
+markers = [
+    "hermetic: needs nothing but a shell — no PKCS#11 token, no containers, no network. Runs in CI.",
+    "pkcs11: needs a PKCS#11 module and the configured test keys (SoftHSM2 or a real HSM).",
+    "gpg: needs the gpg and gpgv binaries.",
+    "sq: needs stock Sequoia sq on PATH.",
+    "rpm: needs rpmbuild and rpmsign.",
+    "containers: needs podman (or docker) and the ability to pull images.",
+]
+
+[tool.ruff]
+line-length = 96
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "PT",   # pytest style
+    "RUF",
+]
+ignore = [
+    # Long assertion messages read better as one string than wrapped mid-sentence.
+    "E501",
+    # "Assertion should be broken down": a compound assert whose message explains
+    # the whole condition is clearer than two asserts that each explain half.
+    "PT018",
+]
+
+[tool.ruff.lint.isort]
+# Not a package, so these resolve as top-level modules — the same way pytest
+# imports them.  Without this they sort as third-party.
+known-first-party = ["conftest", "_inspect"]
+
+[tool.mypy]
+files = ["tests"]
+# No `python_version = "3.9"`: current mypy refuses to target anything below
+# 3.10, so it checks against whatever interpreter it runs on.  The 3.9 floor is
+# enforced by ruff's target-version above (every module has
+# `from __future__ import annotations`, which is what makes the modern
+# annotation syntax legal there) and by actually running the suite on EL9.
+# tests/ is not a package, so its modules resolve as top-level ones
+# — which is also how pytest imports them.
+mypy_path = "tests"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+# Test functions take fixtures as parameters and return None; annotating every
+# one of those returns adds noise without catching anything.
+disallow_untyped_defs = false
