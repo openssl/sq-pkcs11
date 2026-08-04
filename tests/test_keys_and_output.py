@@ -35,24 +35,49 @@ def test_list_keys_shows_test_keys(sqp11: SqPkcs11, pkcs11: Pkcs11Config):
         assert label in stdout, f"expected list-keys to mention {kind} key {label!r}"
 
 
-def test_each_key_label_resolves_to_exactly_one_object(sqp11: SqPkcs11, pkcs11: Pkcs11Config):
-    """A duplicated CKA_LABEL breaks selection by label, confusingly.
+def _keys_by_slot(stdout: str) -> dict[str, list[str]]:
+    """Group `list-keys` output into {slot line: [key lines]}.
 
-    `sign` then fails with `ambiguous slot selection: 2 token slots found`,
-    where the count is actually the number of matching *private-key objects* and
-    the wording sends the operator looking at slots.  It has happened in
-    production; catching it here names the real problem, and the fix is to
-    select by `--key-id` instead.
+    The listing is a `Slot <id>  token: …` header followed by an indented
+    `label=… id=… type=…` line per signing key.
     """
-    lines = sqp11.run("list-keys").success().stdout.splitlines()
+    slots: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in stdout.splitlines():
+        if line.startswith("Slot "):
+            current = line.strip()
+            slots.setdefault(current, [])
+        elif current is not None and line.strip().startswith("label="):
+            slots[current].append(line.strip())
+    return slots
+
+
+def test_each_key_label_resolves_to_one_object_per_slot(sqp11: SqPkcs11, pkcs11: Pkcs11Config):
+    """A CKA_LABEL matching two private-key objects breaks selection by label.
+
+    `sign` then fails with `ambiguous slot selection: 2 token slots found`, where
+    the count is really the number of matching *private-key objects* and the
+    wording sends the operator looking at slots. It has happened in production;
+    the fix there is to select by `--key-id` instead.
+
+    Counted per slot, because that is the scope `find_objects` searches: a
+    module-protected key appears identically on every module's accelerator slot
+    in a multi-module Security World, so the same key legitimately shows up once
+    per module in this listing. Only a duplicate *within* one slot is a problem.
+    """
+    by_slot = _keys_by_slot(sqp11.run("list-keys").success().stdout)
     for kind, label in pkcs11.labels.items():
-        matches = [line for line in lines if f'label="{label}"' in line]
-        assert len(matches) == 1, (
-            f"the {kind} label {label!r} matches {len(matches)} private-key "
-            f"objects; selection by --key-label is not unique, so `sign` will "
-            f"report an ambiguous selection. Note the id= values and use "
-            f"--key-id:\n" + "\n".join(matches)
-        )
+        found = 0
+        for slot, keys in by_slot.items():
+            matches = [key for key in keys if f'label="{label}"' in key]
+            found += len(matches)
+            assert len(matches) <= 1, (
+                f"the {kind} label {label!r} matches {len(matches)} private-key "
+                f"objects on one slot, so selection by --key-label is not unique "
+                f"and `sign` will report an ambiguous selection. Note the id= "
+                f"values and use --key-id instead.\n{slot}\n" + "\n".join(matches)
+            )
+        assert found, f"the {kind} key {label!r} is on no slot at all"
 
 
 def test_key_selector_forms_resolve_same_key(sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path):
