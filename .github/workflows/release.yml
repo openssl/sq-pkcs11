@@ -72,7 +72,11 @@ jobs:
           STAGE="sq-pkcs11-${VERSION}-x86_64-unknown-linux-gnu"
           ARCHIVE="${STAGE}.tar.gz"
           mkdir -p "dist/${STAGE}"
-          cp target/release/sq-pkcs11 LICENSE README.md NSHIELD.md \
+          # The gpg shim ships alongside the binary: consumers that sign
+          # through rpmsign need both, and fetching them from separate places
+          # invites a version skew between the shim and the CLI it drives.
+          cp target/release/sq-pkcs11 contrib/sq-pkcs11-gpg-shim \
+              LICENSE README.md NSHIELD.md \
               "dist/${STAGE}/"
           tar -czf "dist/${ARCHIVE}" -C dist "${STAGE}"
           ( cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256" )
