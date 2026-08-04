@@ -9,8 +9,8 @@ GnuPG, Sequoia, rpm, apt.
 ```sh
 cargo build --release          # the suite tests the binary, so build it first
 
-uv run pytest -m hermetic      # no token, no containers — this is what CI runs
-uv run pytest                  # everything the host can support
+uv run pytest                  # everything the host can support — CI runs this
+uv run pytest -m hermetic      # no token, no containers
 uv run pytest -m "pkcs11 and not containers"
 ```
 
