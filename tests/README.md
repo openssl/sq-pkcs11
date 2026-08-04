@@ -4,6 +4,43 @@ Drives the compiled `sq-pkcs11` binary and `contrib/sq-pkcs11-gpg-shim` as
 subprocesses, and puts what they produce in front of independent verifiers —
 GnuPG, Sequoia, rpm, apt.
 
+## Prerequisites
+
+All of these go on the **host**. pytest is never installed into a target image,
+so nothing here needs to exist inside a container — a target installs whatever
+tooling it is missing itself, on first use.
+
+| Tool | Needed for | Debian/Ubuntu | Fedora/EL | Arch |
+|---|---|---|---|---|
+| `cargo`, Rust ≥ 1.86 | building the binary under test | [rustup](https://rustup.rs) | rustup | `rustup` |
+| `uv` | running the suite; it provisions Python itself | [astral.sh/uv](https://docs.astral.sh/uv/) | ditto | `uv` |
+| `gpg`, `gpgv`, `gpgconf` | the `gpg` layer | `gnupg` | `gnupg2` | `gnupg` |
+| `sq` ≥ 1.0 | the `sq` layer's assertions | `sq` | `sequoia-sq` | `sequoia-sq` |
+| `softhsm2-util`, `pkcs11-tool` | the SoftHSM2 token, provisioned on first run | `softhsm2 opensc` | `softhsm opensc` | `softhsm opensc` |
+| `podman` (or `docker`) | the `rpm` and `containers` layers | `podman` | `podman` | `podman` |
+
+```sh
+sudo apt install gnupg sq softhsm2 opensc podman         # Debian/Ubuntu
+sudo dnf install gnupg2 sequoia-sq softhsm opensc podman # Fedora/EL
+sudo pacman -S gnupg sequoia-sq softhsm opensc podman    # Arch
+```
+
+A missing tool **skips** its tests with the reason rather than failing them, so
+a smaller install still runs the layers it can. Two cases worth knowing:
+
+- `sq` must be 1.x. Older releases parse arguments differently, so one on `PATH`
+  is reported as unusable rather than used and misinterpreted — Ubuntu 24.04
+  ships 0.33, while Ubuntu 26.04 has 1.3.1, Debian trixie 1.2 and EL10 1.3.
+  EL9 packages no `sq` at all, so those assertions skip there.
+- No `rpm`, `rpmbuild`, `dpkg` or `apt` is needed on the host. Those run inside
+  the targets, against the distribution's own version, which is the point of
+  testing there rather than here.
+
+The container layers pull their images on first use, so that run needs network
+access: `almalinux:9`, `almalinux:10`, `debian:11`, `debian:13`, `ubuntu:20.04`.
+
+Signing needs either SoftHSM2 or a real HSM's PKCS#11 module and keys.
+
 ## Running
 
 ```sh
@@ -75,11 +112,12 @@ for everyone. Selecting it is the whole setup: the token, its PIN file and the
 five keys are created on the first run, under `tests/softhsm/` (gitignored).
 
 ```sh
-sudo apt install softhsm2 opensc          # or: dnf install softhsm opensc
 cargo build --release
-
 SQ_PKCS11_TEST_ENV=tests/softhsm.env uv run pytest
 ```
+
+The module is found wherever the distribution put it; set `SOFTHSM_MODULE` to
+use a build of your own instead.
 
 Two limitations to expect against SoftHSM2:
 

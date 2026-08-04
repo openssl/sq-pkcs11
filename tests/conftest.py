@@ -12,7 +12,8 @@ Layers, selected with `-m`:
                 against SoftHSM2 for development and CI, and against a real
                 nShield for the release-signing pass.
     gpg / sq    needs those verifiers on PATH.
-    rpm         needs rpmbuild and rpmsign.
+    rpm         needs podman (or docker) and a token the container can reach.
+                rpmbuild and rpmsign are the target's own, not the host's.
     containers  needs podman or docker, to run the consumers' own parsers.
 
 Configuration lives in `tests/test.env` (see `test.env.example`); with no such
