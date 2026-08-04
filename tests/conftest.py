@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -68,6 +69,7 @@ CONFIG_KEYS = (
     "SQ_PKCS11_GPG_SHIM",
     "SQ_PKCS11_TEST_PIN_FILE",
     "SQ_PKCS11_TEST_CONTAINER_MOUNTS",
+    "SQ_PKCS11_TEST_CONTAINER_ARGS",
     *KEY_VARS.values(),
 )
 
@@ -690,9 +692,18 @@ def _signing_mounts(
             # Read-write: the store is opened for update even when only signing.
             mounts.append(f"{tokens}:{tokens}:rw")
 
-    for extra in CONFIG.get("SQ_PKCS11_TEST_CONTAINER_MOUNTS", "").split(":"):
-        if extra:
-            mounts.append(f"{extra}:{extra}:ro")
+    # Comma-separated, each optionally suffixed `:ro` (the default) or `:rw`.
+    # /opt/nfast wants `:rw`: the module reaches the hardserver over a unix
+    # socket under it, and connecting to a socket needs write permission on the
+    # socket inode, so a read-only bind fails with EACCES.
+    for extra in CONFIG.get("SQ_PKCS11_TEST_CONTAINER_MOUNTS", "").split(","):
+        extra = extra.strip()
+        if not extra:
+            continue
+        path, _, mode = extra.rpartition(":")
+        if mode not in ("ro", "rw"):
+            path, mode = extra, "ro"
+        mounts.append(f"{path}:{path}:{mode}")
 
     # Vendor knobs the module itself reads (nShield's CKNFAST_*, for instance).
     for name, value in os.environ.items():
@@ -712,6 +723,11 @@ def _start_target(
     argv = [runtime, "run", "-d", "-v", f"{artifacts}:/artifacts:ro"]
     for mount in extra_mounts:
         argv += ["-v", mount]
+    # Whatever else the token needs from the runtime.  `--userns=keep-id` is the
+    # one to reach for under rootless podman: without it the host's uids are
+    # remapped and /opt/nfast, owned by root:nfast, is unreadable inside.
+    if extra_mounts:
+        argv += shlex.split(CONFIG.get("SQ_PKCS11_TEST_CONTAINER_ARGS", ""))
     argv += [image, "sleep", "infinity"]
     proc = subprocess.run(argv, capture_output=True, text=True)
     if proc.returncode != 0:
