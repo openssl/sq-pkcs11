@@ -16,7 +16,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config softhsm2 opensc gnupg sq rust
+            libssl-dev pkg-config softhsm2 opensc gnupg sq
+
+      - name: Install Rust 1.86
+        # The MSRV declared in Cargo.toml, so rust-version is verified here
+        # rather than only documented.
+        run: |
+          rustup toolchain install 1.86 --profile minimal \
+              --component rustfmt --component clippy
+          rustup default 1.86
+          rustc --version
 
       - name: Format check
         run: cargo fmt --check
@@ -25,10 +34,10 @@ jobs:
         run: cargo clippy --no-deps --all-targets --all-features -- -D warnings
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Run unit tests (release)
-        run: cargo test --release --bins
+        run: cargo test --release --locked --bins
 
       - name: Provision a SoftHSM2 token
         run: tests/provision-softhsm.sh
@@ -40,3 +49,4 @@ jobs:
         env:
           SQ_PKCS11_TEST_ENV: tests/softhsm.env
         run: uv run --frozen pytest -v
+
