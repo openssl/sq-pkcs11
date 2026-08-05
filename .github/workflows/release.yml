@@ -1,20 +1,10 @@
 name: Release
 
-# Fires when cargo-release pushes a `vX.Y.Z` tag.  Builds the Linux/amd64
-# binary, smoke-tests it, packages it with the licence + docs, and creates
-# a GitHub Release with the tarball and its SHA-256.
-#
-# Tests are NOT re-run here: cargo-release's pre-release-hook ran them
-# before tagging, and the regular CI workflow ran them on the tagged
-# commit when it landed on main.  Running them a third time would slow
-# the release for no signal.
-
 on:
   push:
     tags:
       - 'v*'
 
-# `gh release create` writes to repo Releases, which needs contents:write.
 permissions:
   contents: write
 
@@ -23,11 +13,8 @@ jobs:
     name: Build & release (linux-amd64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
-          # vergen's build.rs runs `git describe --tags` to embed the version
-          # string into the binary; needs the full history (and the pushed
-          # tag) to produce a real value instead of the fallback placeholder.
           fetch-depth: 0
 
       - name: Install system dependencies
@@ -37,8 +24,6 @@ jobs:
             libssl-dev pkg-config
 
       - name: Install Rust 1.86
-        # Pin to the MSRV declared in Cargo.toml, which ci.yml's `msrv` job also
-        # builds against, so the released binary comes from a toolchain we test.
         run: |
           rustup toolchain install 1.86 --profile minimal
           rustup default 1.86
@@ -46,25 +31,17 @@ jobs:
           cargo --version
 
       - name: Build (release, locked)
-        # --locked: refuse to update Cargo.lock.  Guarantees a reproducible
-        # build from the exact dependency tree that was tested.
         run: cargo build --release --locked
 
       - name: Strip binary
         run: strip target/release/sq-pkcs11
 
       - name: Smoke-test --version
-        # If vergen or the version-string wiring is broken, --version will
-        # either fail to compile (caught earlier) or emit a placeholder
-        # without the tag; assert it includes the pushed tag's number.
         run: |
           ./target/release/sq-pkcs11 --version
           ./target/release/sq-pkcs11 --version | grep -q "${GITHUB_REF_NAME#v}"
 
       - name: Package & create GitHub release
-        # Use the runner-preinstalled `gh` CLI rather than a third-party
-        # release action: no extra supply-chain surface for the artifact
-        # this tool will sign.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -72,9 +49,6 @@ jobs:
           STAGE="sq-pkcs11-${VERSION}-x86_64-unknown-linux-gnu"
           ARCHIVE="${STAGE}.tar.gz"
           mkdir -p "dist/${STAGE}"
-          # The gpg shim ships alongside the binary: consumers that sign
-          # through rpmsign need both, and fetching them from separate places
-          # invites a version skew between the shim and the CLI it drives.
           cp target/release/sq-pkcs11 contrib/sq-pkcs11-gpg-shim \
               LICENSE README.md NSHIELD.md \
               "dist/${STAGE}/"
