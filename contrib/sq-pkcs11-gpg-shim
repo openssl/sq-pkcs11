@@ -2,85 +2,74 @@
 #
 # sq-pkcs11-gpg-shim — a gpg(1)-compatible front end for `sq-pkcs11 sign`.
 #
-# Tools that sign through GnuPG usually do it by exec'ing a gpg command line
-# rather than by linking a library.  `rpmsign --addsign` is the motivating
-# case: it expands rpm's %__gpg_sign_cmd macro, which boils down to
+# Lets tools that sign by exec'ing a gpg command line sign against a PKCS#11
+# HSM instead, with no private key on disk and no gpg-agent.  Two callers drive
+# it, and their command lines differ in ways that are load-bearing.
 #
-#     gpg --no-verbose --no-armor [--digest-algo=X] -u "<_gpg_name>" \
+# rpmsign --addsign, through rpm's %__gpg_sign_cmd:
+#
+#     gpg --no-verbose --no-armor [--digest-algo=X] -u <_gpg_name> \
 #         -sbo <signature-file> -
 #
-# and requires the invoked binary to write a BINARY detached signature to the
-# -o path and exit 0.  rpm then embeds those raw OpenPGP packets in the
-# package header.  This script accepts that command line, translates it into
-# an `sq-pkcs11 sign` invocation, and so lets any such tool sign against a
-# PKCS#11 HSM without a private key on disk and without a gpg-agent.
+#   The data arrives on STDIN — both rpm 4.16.1.3 (EL9) and 4.19.1.1 (EL10)
+#   pass `-` and pipe the package in — the binary detached signature must land
+#   on the -o path, and rpm 4.19 probes `--version` first, giving up if it
+#   exits non-zero.
 #
-# Two details of that contract are easy to miss and are both load-bearing, as
-# measured on rpm 4.16.1.3 (EL9) and rpm 4.19.1.1 (EL10):
+# git, through `gpg.program` (gpg-interface.c):
 #
-#   * the data to sign arrives on STDIN, not as a path.  Both versions pass `-`
-#     as the file operand and pipe the package's header+payload in;
-#   * rpm 4.19 first runs the configured gpg with `--version` and gives up if
-#     that exits non-zero.
+#     gpg --status-fd=2 -bsau <keyid> < payload > armored_signature
 #
-# What is supported: detached signing (binary or armored) and cleartext
-# signing (`--clearsign`).  Nothing else — this is not a gpg replacement.
-# Encryption, verification, key management and keyring access are all absent;
-# asking for them is an error rather than a silent no-op.
+#   No -o at all: the signature goes to STDOUT.  And the SIG_CREATED status
+#   line is mandatory — git scans for it and fails the signing without it,
+#   however good the signature (checked on git 2.55).
+#
+# Signing only: detached (binary or armored) and cleartext.  Verification,
+# encryption and key management are errors rather than silent no-ops.  They are
+# also things gpg and sq already do, and an HSM adds nothing to them, so
+# `git tag -v` and `gpg --verify` want the real tool.
 #
 # ─── Configuration ──────────────────────────────────────────────────────────
 #
-# The caller's command line carries the signing key name and the file paths.
-# Everything sq-pkcs11 needs that gpg has no flag for comes from the
+# The command line carries the key name and the paths; the rest comes from the
 # environment:
 #
-#   PKCS11_MODULE_PATH      Vendor PKCS#11 library.  Required (or SQ_PKCS11_MODULE).
-#   SQ_PKCS11_CERT          Published certificate; passed as --input-cert, which
-#                           derives the key-creation time by matching the HSM
-#                           key's public material.  Preferred over
-#                           SQ_PKCS11_CREATION_TIME: nothing to keep in sync.
-#   SQ_PKCS11_CREATION_TIME RFC 3339 key-creation time; passed as
-#                           --creation-time.  One of these two is required —
-#                           sq-pkcs11 refuses to guess (see its error text).
-#   SQ_PKCS11_KEY_LABEL     CKA_LABEL to sign with when the caller passes no -u
-#                           (rpm 4.19 omits it when %_gpg_name is unset).  An
-#                           explicit -u wins over this.
-#   SQ_PKCS11_PIN_FILE      Passed as --pin-file, for a softcard- or
-#                           single-card-OCS-protected key.  Omit for a
-#                           module-protected key, which is the unattended case.
-#   SQ_PKCS11_BIN           sq-pkcs11 to run.  Default: `sq-pkcs11` on PATH.
+#   PKCS11_MODULE_PATH       Vendor PKCS#11 library.  Required (or SQ_PKCS11_MODULE).
+#   SQ_PKCS11_CERT           Published cert, passed as --input-cert: derives the
+#                            key-creation time by matching the HSM key's public
+#                            material.  Preferred — nothing to keep in sync.
+#   SQ_PKCS11_CREATION_TIME  RFC 3339 key-creation time, passed as
+#                            --creation-time.  One of these two is required;
+#                            sq-pkcs11 refuses to guess.  A wrong value yields a
+#                            signature whose issuer fingerprint matches no
+#                            published key.
+#   SQ_PKCS11_KEY_LABEL      CKA_LABEL used when the caller passes no -u (rpm
+#                            4.19 omits it when %_gpg_name is unset).  An
+#                            explicit -u wins.
+#   SQ_PKCS11_PIN_FILE       Passed as --pin-file, for a softcard or K=1 OCS
+#                            key.  Omit for a module-protected key, which is
+#                            the unattended case.
+#   SQ_PKCS11_BIN            sq-pkcs11 to run.  Default: `sq-pkcs11` on PATH.
 #
-# SQ_PKCS11_PIN and SQ_PKCS11_SUBKEY_PIN are actively removed from the
-# environment before sq-pkcs11 runs.  Those variables switch sq-pkcs11 into
-# PKCS#11 login mode; a module-protected key needs login mode None, and a
-# value that merely happens to be exported in a CI environment would flip the
-# mode and take the login-required-token code path — which fails, or worse
-# picks a different slot.  Ambient credentials must not steer key selection,
-# so the explicit SQ_PKCS11_PIN_FILE above is the only way in.
+# SQ_PKCS11_PIN and SQ_PKCS11_SUBKEY_PIN are removed from the environment
+# first: they switch sq-pkcs11 into PKCS#11 login mode, a module-protected key
+# needs login mode None, and an inherited value would change which slot is
+# selected.  SQ_PKCS11_PIN_FILE is the only way in.
 #
-# ─── rpm macro overrides ────────────────────────────────────────────────────
+# ─── Wiring it up ───────────────────────────────────────────────────────────
 #
-# Point rpm's gpg at this script and name the HSM key:
+#   rpmsign --addsign --define "_gpg_name <CKA_LABEL>" \
+#           --define "__gpg $(command -v sq-pkcs11-gpg-shim)" package.rpm
 #
-#   rpmsign --addsign \
-#       --define "_gpg_name <CKA_LABEL>" \
-#       --define "__gpg $(command -v sq-pkcs11-gpg-shim)" \
-#       package.rpm
+#   git -c gpg.program=$(command -v sq-pkcs11-gpg-shim) \
+#       tag -s -u <CKA_LABEL> <tag> -m <message>
 #
-# Overriding %__gpg keeps the distro's own %__gpg_sign_cmd, so the contract
-# stays whatever that rpm version expects.  Both shapes shipped today work:
-# rpm 4.16 (EL9) execve()s the binary directly and passes `--digest-algo X`,
-# rpm 4.19 (EL10) goes through a shell, passes `--digest-algo=X`, and leaves
-# the literal string `gpg` as the first argument.
-#
-# To pass extra sq-pkcs11 flags, override the whole command instead:
-#
-#   --define "__gpg_sign_cmd %{__gpg} gpg --no-verbose --no-armor \
-#       -u %{_gpg_name} -sbo %{__signature_filename} %{__plaintext_filename}"
-#
-# The same works for ~/.rpmmacros or /etc/rpm/macros.d/, and %_gpg_name must
-# be the HSM CKA_LABEL — not an email address or fingerprint, because -u is
-# mapped to sq-pkcs11's --key-label.
+# Overriding %__gpg alone keeps the distro's own %__gpg_sign_cmd, so the
+# contract stays whatever that rpm version expects; override %__gpg_sign_cmd
+# itself to add sq-pkcs11 flags.  Give git `gpg.program` per command rather
+# than in config, so `git tag -v` still reaches a real gpg.  %_gpg_name and -u
+# are both the HSM CKA_LABEL: -u becomes --key-label, not a search over user
+# IDs, so an email address or fingerprint will not resolve.
 #
 set -euo pipefail
 
@@ -108,27 +97,26 @@ in_list() {
 # ---------------------------------------------------------------------------
 # Argument parsing.
 #
-# Tolerant by design: a caller's gpg command line carries plenty of options
-# that have no bearing on what we do (keyring paths, fd plumbing, verbosity),
-# and rejecting them would mean chasing every distro's macro edits.  Those are
-# consumed and dropped.  Options that would change the *meaning* of the
-# operation are not silently dropped.
+# Tolerant by design: a caller's command line carries options that have no
+# bearing on what we do (keyring paths, fd plumbing, verbosity), and rejecting
+# them would mean chasing every distro's macro edits and every git release.
+# Options that would change the *meaning* of the operation are not dropped.
 # ---------------------------------------------------------------------------
 
 key_label=${SQ_PKCS11_KEY_LABEL:-}
 output=
+status_fd=
 digest_algo=
 armor=0
 cleartext=0
 positional=()
 
-# Long options that take a value we have no use for.  The value must still be
-# consumed, or it would be left behind as an operand and mistaken for the file
-# to sign.
+# Long options whose value must still be consumed, or it would be left behind
+# as an operand and mistaken for the file to sign.
 value_consuming_ignored=(
     --homedir --keyring --secret-keyring --primary-keyring --trustdb-name
     --options --passphrase --passphrase-fd --passphrase-file --pinentry-mode
-    --status-fd --logger-fd --attribute-fd --command-fd --log-file
+    --logger-fd --attribute-fd --command-fd --log-file
     --set-filename --comment --cert-digest-algo --compress-algo --compress-level
     --personal-digest-preferences --personal-cipher-preferences
     --personal-compress-preferences --trust-model --keyid-format --display-charset
@@ -157,6 +145,14 @@ while (($#)); do
     --output=*)
         output=${arg#*=}
         ;;
+    --status-fd)
+        (($#)) || die "$arg requires a value"
+        status_fd=$1
+        shift
+        ;;
+    --status-fd=*)
+        status_fd=${arg#*=}
+        ;;
     --armor | --armour | --enarmor)
         armor=1
         ;;
@@ -175,12 +171,9 @@ while (($#)); do
         digest_algo=${arg#*=}
         ;;
 
-    # rpm 4.19 probes the configured gpg with `--version` before it signs
-    # anything, and treats a non-zero exit as "gpg is broken" — so answering
-    # this is load-bearing, not a nicety.  The first line is the machine-
-    # readable part every gpg version banner starts with, and it is what a
-    # caller sniffing for GnuPG matches on; the lines after it say plainly
-    # what this actually is.
+    # rpm 4.19 treats a non-zero exit here as "gpg is broken", so answering is
+    # load-bearing.  The first line is what a caller sniffing for GnuPG matches
+    # on; the rest says what this actually is.
     --version)
         echo "gpg (GnuPG) 2.4.0"
         echo "$PROG: gpg-compatible signing front end for sq-pkcs11"
@@ -189,8 +182,7 @@ while (($#)); do
         exit 0
         ;;
 
-    # End of options: everything left is an operand.  rpm 4.19 emits
-    # `-sbo <sigfile> -- -`, so this arrives in practice.
+    # End of options.  rpm 4.19 emits `-sbo <sigfile> -- -`, so this arrives.
     --)
         while (($#)); do
             positional+=("$1")
@@ -205,8 +197,10 @@ while (($#)); do
         --delete-key | --delete-secret-key | --edit-key | --sign-key | \
         --gen-revoke | --card-status | --card-edit | --change-pin)
         die "$arg is not supported; this shim only creates signatures with an HSM key.
-sq-pkcs11 covers certificate export and revocation as its own subcommands;
-everything else needs real gpg."
+Verification and keyring work need real gpg or sq, which an HSM adds nothing
+to; certificate export and revocation are sq-pkcs11 subcommands of their own.
+For git, that means giving gpg.program per command rather than in config, so
+\`git tag -v\` still reaches a real gpg."
         ;;
 
     # ── boilerplate: understood, irrelevant, dropped ────────────────────
@@ -234,7 +228,7 @@ everything else needs real gpg."
         fi
         ;;
 
-    # ── short-option clusters: -b, -sb, -sbo FILE, -uNAME ───────────────
+    # ── short-option clusters: -b, -sb, -sbo FILE, -uNAME, git's -bsau ──
     -?*)
         rest=${arg#-}
         while [[ -n $rest ]]; do
@@ -279,12 +273,11 @@ everything else needs real gpg."
     esac
 done
 
-# Both rpm versions expand %__gpg_sign_cmd to a command line that begins
-# `<path-to-gpg> gpg --no-verbose …`.  rpm itself execve()s the path with "gpg"
-# as argv[0], so that word never reaches us — but a caller that routes the same
-# macro text through a shell (`sh -c "$(rpm --eval %__gpg_sign_cmd)"`) leaves it
-# behind as an operand, where it would trip the arity check below.  Drop it;
-# nobody signs a file called `gpg`.
+# Both rpm versions expand %__gpg_sign_cmd to `<path-to-gpg> gpg --no-verbose
+# …`.  rpm execve()s the path with "gpg" as argv[0] so the word never reaches
+# us, but routing the same macro text through a shell leaves it behind as an
+# operand, where it would trip the arity check below.  Nobody signs a file
+# called `gpg`.
 filtered=()
 for p in ${positional[@]+"${positional[@]}"}; do
     case ${p##*/} in
@@ -297,29 +290,26 @@ if ((${#filtered[@]} > 1)); then
     die "expected exactly one input file, got ${#filtered[@]}: ${filtered[*]}
 (signing several files in one call is a gpg feature this shim does not have)"
 fi
-# gpg signs standard input when the operand is `-`, or when there is no operand
-# at all.  That is not an edge case here: it is how rpm feeds a package to the
-# signer.  rpm 4.16 and 4.19 both pipe the header+payload to be signed over
-# stdin and pass `-` as the file name, so a shim that only understands real
-# paths cannot sign an rpm at all.
+
+# gpg reads stdin when the operand is `-` or absent, and both callers rely on
+# it: rpm passes `-` and pipes the package, git passes no operand at all.
 plaintext=${filtered[0]-'-'}
 
-[[ -n $output ]] ||
-    die "no output path given; pass -o/--output <file> (rpm supplies it via -sbo)"
+# Likewise gpg writes to stdout when there is no -o, which is the only way git
+# can receive a signature.
+[[ -n $output ]] || output=-
 
 if [[ -z $key_label ]]; then
     die "no signing key given.
 Pass -u <CKA_LABEL>, or set SQ_PKCS11_KEY_LABEL.  Under rpmsign that means
---define \"_gpg_name <CKA_LABEL>\"; the value is the HSM object's CKA_LABEL,
-not an email address or a fingerprint."
+--define \"_gpg_name <CKA_LABEL>\"; under git, user.signingkey.  The value is
+the HSM object's CKA_LABEL, not an email address or a fingerprint — note that
+git falls back to the committer identity, which is such an address."
 fi
 
-# sq-pkcs11 picks its hash to match the signing key's strength (P-256/SHA-256,
-# P-384/SHA-384, P-521/SHA-512, RSA/SHA-512) and has no override.  The hash is
-# recorded in the signature itself, so verifiers read it from there rather than
-# being told out of band, and both rpm parsers do exactly that — an ignored
-# request is a cosmetic difference, not a verification failure.  Say so once,
-# only when something actually asked.
+# sq-pkcs11 picks the hash to match the signing key's strength and has no
+# override.  The choice is recorded in the signature, where verifiers read it
+# from, so an ignored request is cosmetic — but say so when something asks.
 if [[ -n $digest_algo ]]; then
     warn "ignoring --digest-algo $digest_algo: sq-pkcs11 selects the digest to match the signing key"
 fi
@@ -332,13 +322,10 @@ sq=${SQ_PKCS11_BIN:-sq-pkcs11}
 command -v "$sq" >/dev/null ||
     die "sq-pkcs11 not found (looked for ${sq@Q}); set SQ_PKCS11_BIN to its path"
 
-# sq-pkcs11 signs a named file, so a stdin operand has to be spooled.  Signing
-# straight from the pipe is not an option anyway: the OpenPGP signature is over
-# a hash of the whole input, so it cannot be emitted until the last byte has
-# arrived.  Mode 0600 via mktemp, in a private directory, removed on any exit —
-# the bytes are a package about to be published, not a secret, but they are the
-# bytes being attested to and must not be swappable for something else
-# mid-signature.
+# sq-pkcs11 signs a named file, so stdin has to be spooled.  Signing from the
+# pipe is impossible anyway: the signature is over a hash of the whole input.
+# A private directory, removed on any exit — these are the bytes being attested
+# to, and must not be swappable for something else mid-signature.
 spool=
 if [[ $plaintext == - ]]; then
     if [[ -t 0 ]]; then
@@ -352,9 +339,9 @@ Expected a gpg-style detached-sign command line such as:
     cat >"$plaintext"
 fi
 
-# --force: gpg's -o overwrites, and callers rely on that.  rpm in particular
-# creates the signature file with mkstemp before invoking us, so without
-# --force sq-pkcs11's refuse-to-clobber guard would reject every rpmsign run.
+# --force: gpg's -o overwrites and callers rely on it.  rpm creates the
+# signature file with mkstemp before invoking us, so without --force
+# sq-pkcs11's refuse-to-clobber guard would reject every rpmsign run.
 argv=("$sq" sign --force --key-label "$key_label")
 
 if ((cleartext)); then
@@ -372,11 +359,23 @@ argv+=(--output "$output" -- "$plaintext")
 
 unset SQ_PKCS11_PIN SQ_PKCS11_SUBKEY_PIN
 
-if [[ -z $spool ]]; then
+# exec only when there is nothing left to do afterwards: a spool to remove
+# needs the EXIT trap, and a status line needs us to outlive sq-pkcs11.
+if [[ -z $spool && -z $status_fd ]]; then
     exec "${argv[@]}"
 fi
-# With a spool directory to clean up we cannot exec; run and forward the status
-# so the EXIT trap fires.
 status=0
 "${argv[@]}" || status=$?
-exit "$status"
+((status == 0)) || exit "$status"
+
+# git requires this line, per the note at the top; rpm never asks for it.
+# Fields are per GnuPG's doc/DETAILS —
+#   SIG_CREATED <type> <pk_algo> <hash_algo> <class> <timestamp> <fpr>
+# — but git matches the keyword and reads none of them, and we have no
+# fingerprint to offer, so the rest are placeholders.  The leading newline
+# guarantees the line boundary git's search needs.  Never onto fd 1: that
+# carries the signature, and the line would land inside the armor.
+if [[ -n $status_fd && $status_fd != 1 ]]; then
+    printf '\n[GNUPG:] SIG_CREATED D 1 10 00 %d sq-pkcs11\n' "$(date -u +%s)" \
+        >&"$status_fd" 2>/dev/null || true
+fi

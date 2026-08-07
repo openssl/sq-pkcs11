@@ -12,6 +12,9 @@ Layers, selected with `-m`:
                 against SoftHSM2 for development and CI, and against a real
                 nShield for the release-signing pass.
     gpg / sq    needs those verifiers on PATH.
+    git         needs git.  The shim's second caller, driven through a real
+                `git tag -s` rather than only given the argv git is believed
+                to emit.
     rpm         needs podman (or docker) and a token the container can reach.
                 rpmbuild and rpmsign are the target's own, not the host's.
     containers  needs podman or docker, to run the consumers' own parsers.
@@ -636,6 +639,12 @@ def sq(tmp_path: Path) -> Sq:
     home.chmod(stat.S_IRWXU)
     _usable_sq()
     return Sq(home)
+
+
+@pytest.fixture(scope="session")
+def git_bin() -> str:
+    """git, whose `gpg.program` command line the shim has to satisfy."""
+    return _require("git")
 
 
 @pytest.fixture(scope="session")

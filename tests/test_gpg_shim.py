@@ -377,7 +377,6 @@ def test_digest_algo_is_ignored_but_reported(
         "--homedir",
         "--keyring",
         "--secret-keyring",
-        "--status-fd",
         "--passphrase-fd",
         "--pinentry-mode",
         "--trust-model",
@@ -476,12 +475,13 @@ def test_unsupported_operations_fail_loudly(shim: ShimRunner, tmp_path: Path, op
     assert shim.records() == [], "nothing may be signed for an unsupported operation"
 
 
-def test_missing_output_path_fails(shim: ShimRunner, tmp_path: Path):
+def test_missing_output_path_streams_to_stdout(shim: ShimRunner, tmp_path: Path):
+    """gpg writes to stdout with no -o, and it is how git receives a signature."""
     payload = tmp_path / "f"
     payload.write_text("x")
     proc = shim.run("--no-armor", "-u", "lbl", payload)
-    assert proc.returncode != 0
-    assert "no output path given" in proc.stderr.decode()
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert _argv_value(shim.sign_argv(), "--output") == "-"
 
 
 def test_missing_key_fails_with_the_macro_hint(

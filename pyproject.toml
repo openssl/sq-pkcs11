@@ -1,8 +1,8 @@
 # Python environment for the integration test suite.
 #
-# The suite drives the compiled `sq-pkcs11` binary and the `contrib/`
-# gpg shim as subprocesses; it is not a Python package and nothing here is
-# needed to build or run sq-pkcs11 itself.
+# The suite drives the compiled `sq-pkcs11` binary and the `contrib/` shims as
+# subprocesses; it is not a Python package and nothing here is needed to build
+# or run sq-pkcs11 itself.
 #
 #   uv run pytest -m hermetic            # no HSM, no containers
 #   uv run pytest                        # everything the host can support
@@ -37,6 +37,7 @@ markers = [
     "pkcs11: needs a PKCS#11 module and the configured test keys (SoftHSM2 or a real HSM).",
     "gpg: needs the gpg and gpgv binaries.",
     "sq: needs stock Sequoia sq on PATH.",
+    "git: needs git, to drive the git shim through a real `git tag -s`.",
     "rpm: needs rpmbuild and rpmsign.",
     "containers: needs podman (or docker) and the ability to pull images.",
 ]

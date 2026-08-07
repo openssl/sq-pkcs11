@@ -2,7 +2,7 @@
 
 Drives the compiled `sq-pkcs11` binary and `contrib/sq-pkcs11-gpg-shim` as
 subprocesses, and puts what they produce in front of independent verifiers —
-GnuPG, Sequoia, rpm, apt.
+GnuPG, Sequoia, rpm, apt, git.
 
 ## Prerequisites
 
@@ -16,6 +16,7 @@ tooling it is missing itself, on first use.
 | `uv` | running the suite; it provisions Python itself | [astral.sh/uv](https://docs.astral.sh/uv/) | ditto | `uv` |
 | `gpg`, `gpgv`, `gpgconf` | the `gpg` layer | `gnupg` | `gnupg2` | `gnupg` |
 | `sq` ≥ 1.0 | the `sq` layer's assertions | `sq` | `sequoia-sq` | `sequoia-sq` |
+| `git` | the `git` layer: real `git tag -s` through the shim | `git` | `git` | `git` |
 | `softhsm2-util`, `pkcs11-tool` | the SoftHSM2 token, provisioned on first run | `softhsm2 opensc` | `softhsm opensc` | `softhsm opensc` |
 | `podman` (or `docker`) | the `rpm` and `containers` layers | `podman` | `podman` | `podman` |
 
@@ -58,6 +59,7 @@ uv run pytest -m "pkcs11 and not containers"
 | `hermetic` | nothing | the gpg shim's argument handling, against a stub sq-pkcs11 |
 | `pkcs11` | a PKCS#11 module and the configured keys | sign, cert-export, revocation, verify-signing-key |
 | `gpg` / `sq` | `gpg`+`gpgv` / `sq` on PATH | verification by the two implementations that matter |
+| `git` | `git` on PATH | the shim under real `git tag -s`, which is the only cover for the mandatory `SIG_CREATED` line |
 | `rpm` | `podman`, plus a token the container can reach | `rpmsign --addsign` through the shim, on rpm 4.16 *and* 4.19 |
 | `containers` | `podman` or `docker` | the consumers' own parsers: EL9/EL10 rpm, debian:11 and ubuntu:20.04 gpgv |
 
