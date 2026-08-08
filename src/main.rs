@@ -234,6 +234,62 @@ struct SignArgs {
     /// silently falls back to the Unix-epoch default.
     #[arg(long, value_name = "FILE")]
     input_cert: Option<PathBuf>,
+
+    /// Refuse to sign unless the HSM key is exactly this algorithm and size.
+    ///
+    /// A deployment's key policy is not something this tool can infer, and
+    /// getting it wrong is expensive to undo: rpm 4.16 (EL9) cannot verify
+    /// ECDSA at all, so a package signed with the wrong key type is only
+    /// discovered by the consumer.  Stating the requirement at the call site
+    /// turns that into a refusal to sign.
+    ///
+    /// The match is exact, not a minimum: `rsa4096` accepts RSA-4096 and
+    /// rejects RSA-3072 *and* RSA-8192.  A policy says which key is in use,
+    /// not which keys would be strong enough.
+    #[arg(long, value_name = "ALGO", value_enum)]
+    require_key_algo: Option<RequiredKeyAlgo>,
+
+    /// Skip the signer-validity pre-flight that --input-cert performs.
+    ///
+    /// With --input-cert, sign first proves the HSM key is a *current valid
+    /// signer* in that certificate — not revoked, not expired, and carrying
+    /// the signing flag — because matching the key material alone would still
+    /// accept a rotated-out subkey that is deliberately kept in the cert so
+    /// old signatures keep verifying.
+    ///
+    /// Pass this only to sign deliberately with a key the cert no longer
+    /// advertises as current; the resulting signature will be rejected by
+    /// verifiers applying the same policy.
+    #[arg(long, requires = "input_cert")]
+    no_verify_signing_key: bool,
+}
+
+/// Key algorithms `sign --require-key-algo` can be pinned to.
+///
+/// Deliberately an enum rather than a free-form string: the values are the
+/// algorithms this tool supports at all, so `--help` lists them and a typo is
+/// a parse error instead of a policy check that silently never matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RequiredKeyAlgo {
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    P256,
+    P384,
+    P521,
+}
+
+impl RequiredKeyAlgo {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rsa2048 => "RSA-2048",
+            Self::Rsa3072 => "RSA-3072",
+            Self::Rsa4096 => "RSA-4096",
+            Self::P256 => "ECDSA P-256",
+            Self::P384 => "ECDSA P-384",
+            Self::P521 => "ECDSA P-521",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +1010,47 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
     };
     signer.set_creation_time(creation_time)?;
 
+    // Both checks below run before the first signing operation, so a refusal
+    // costs nothing: no signature is produced and no key-usage entry is
+    // written to the HSM's audit log.
+    if let Some(required) = args.require_key_algo {
+        if !key_matches_algo(signer.public_key(), required) {
+            anyhow::bail!(
+                "--require-key-algo {} was given, but the selected key is {}.\n\
+                 Nothing was signed.  Either the wrong key was selected, or the \
+                 policy names the wrong algorithm.",
+                required.as_str(),
+                describe_key_algo(signer.public_key()),
+            );
+        }
+    }
+
+    // With a cert in hand, prove the key is still a *current* signer in it
+    // before signing anything.  Deriving the creation time from the cert
+    // (above) only proves the key is present, and an old subkey stays present
+    // on purpose so its past signatures keep verifying — so material matching
+    // alone would happily sign with a rotated-out, revoked or expired key and
+    // produce an artefact that every policy-applying verifier rejects.
+    if let Some(cert) = &input_cert {
+        if !args.no_verify_signing_key {
+            let cert_path = args
+                .input_cert
+                .as_deref()
+                .expect("input_cert parsed, so the path was given");
+            require_current_signer(
+                cert,
+                signer.public_key(),
+                creation_time,
+                std::time::SystemTime::now(),
+                cert_path,
+            )
+            .context(
+                "refusing to sign: the key is not a current valid signer in --input-cert \
+                 (pass --no-verify-signing-key to sign anyway)",
+            )?;
+        }
+    }
+
     // Pick the hash algorithm to match the signing key strength — same
     // policy used for cert self-signatures (cert::preferred_hash_for).
     let hash_algo = cert::preferred_hash_for(signer.public_key());
@@ -1370,10 +1467,176 @@ fn write_revocation_output(
 // verify-signing-key
 // ---------------------------------------------------------------------------
 
-fn cmd_verify_signing_key(pkcs11: &Pkcs11, args: VerifySigningKeyArgs) -> anyhow::Result<()> {
+/// Algorithm and size of an HSM public key, in the vocabulary
+/// `--require-key-algo` uses.
+fn describe_key_algo(
+    public: &sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    >,
+) -> String {
+    use sequoia_openpgp::crypto::mpi;
+    use sequoia_openpgp::types::Curve;
+    match public.mpis() {
+        mpi::PublicKey::RSA { n, .. } => format!("RSA-{}", n.bits()),
+        mpi::PublicKey::ECDSA { curve, .. } => match curve {
+            Curve::NistP256 => "ECDSA P-256".to_string(),
+            Curve::NistP384 => "ECDSA P-384".to_string(),
+            Curve::NistP521 => "ECDSA P-521".to_string(),
+            other => format!("ECDSA {other}"),
+        },
+        _ => format!("{}", public.pk_algo()),
+    }
+}
+
+/// Whether an HSM key is exactly the algorithm and size a policy pinned.
+///
+/// Matched structurally rather than by comparing rendered strings: this
+/// decides whether a release gets signed, and a formatting change must not be
+/// able to turn it into a check that silently never matches.
+fn key_matches_algo(
+    public: &sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    >,
+    required: RequiredKeyAlgo,
+) -> bool {
+    use sequoia_openpgp::crypto::mpi;
+    use sequoia_openpgp::types::Curve;
+    match (public.mpis(), required) {
+        (mpi::PublicKey::RSA { n, .. }, RequiredKeyAlgo::Rsa2048) => n.bits() == 2048,
+        (mpi::PublicKey::RSA { n, .. }, RequiredKeyAlgo::Rsa3072) => n.bits() == 3072,
+        (mpi::PublicKey::RSA { n, .. }, RequiredKeyAlgo::Rsa4096) => n.bits() == 4096,
+        (
+            mpi::PublicKey::ECDSA {
+                curve: Curve::NistP256,
+                ..
+            },
+            RequiredKeyAlgo::P256,
+        ) => true,
+        (
+            mpi::PublicKey::ECDSA {
+                curve: Curve::NistP384,
+                ..
+            },
+            RequiredKeyAlgo::P384,
+        ) => true,
+        (
+            mpi::PublicKey::ECDSA {
+                curve: Curve::NistP521,
+                ..
+            },
+            RequiredKeyAlgo::P521,
+        ) => true,
+        _ => false,
+    }
+}
+
+/// The OpenPGP fingerprint an HSM key has when stamped with `creation_time`.
+fn hsm_key_fingerprint(
+    public: &sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    >,
+    creation_time: std::time::SystemTime,
+) -> anyhow::Result<sequoia_openpgp::Fingerprint> {
+    let key =
+        sequoia_openpgp::packet::Key::V4(sequoia_openpgp::packet::key::Key4::<
+            sequoia_openpgp::packet::key::PublicParts,
+            sequoia_openpgp::packet::key::PrimaryRole,
+        >::new(
+            creation_time, public.pk_algo(), public.mpis().clone()
+        )?);
+    Ok(key.fingerprint())
+}
+
+/// Prove the HSM key, stamped with `creation_time`, is a *current valid
+/// signer* in `cert` at `at_time`.
+///
+/// Shared by `verify-signing-key` and by `sign`'s `--input-cert` pre-flight so
+/// the two can never disagree about what "valid signer" means.
+///
+/// Note what matching key material alone would miss: an old subkey stays in a
+/// published cert on purpose, so signatures it made keep verifying.  Material
+/// matching therefore accepts a rotated-out key happily; only a policy check
+/// at a reference time rejects it.
+fn require_current_signer(
+    cert: &sequoia_openpgp::Cert,
+    public: &sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    >,
+    creation_time: std::time::SystemTime,
+    at_time: std::time::SystemTime,
+    cert_path: &std::path::Path,
+) -> anyhow::Result<sequoia_openpgp::Fingerprint> {
     use sequoia_openpgp::policy::StandardPolicy;
     use sequoia_openpgp::types::KeyFlags;
 
+    let hsm_fpr = hsm_key_fingerprint(public, creation_time)?;
+
+    // Apply Sequoia's StandardPolicy at the chosen reference time.
+    // ValidCert::keys() yields keys whose binding signatures are valid
+    // under that policy at that time.  Filtering on .alive() rejects
+    // expired keys; .revoked(false) rejects revoked keys; key_flags()
+    // restricts to signing-capable.
+    //
+    // We accept BOTH the primary and any subkey as a valid match: a
+    // single-tier cert (no subkeys, primary carries the signing flag)
+    // is a reasonable deployment that we shouldn't reject here.  Any
+    // policy that requires a specific structure (e.g. "release artefacts
+    // must be signed by a subkey, never the primary") belongs in the
+    // operator's wrapper, not in this generic primitive.
+    let policy = StandardPolicy::new();
+    let valid = cert.with_policy(&policy, at_time).with_context(|| {
+        format!(
+            "input cert {} fails StandardPolicy validation at {}",
+            cert_path.display(),
+            humantime::format_rfc3339(at_time),
+        )
+    })?;
+
+    let signing_flag = KeyFlags::empty().set_signing();
+    let candidates: Vec<_> = valid
+        .keys()
+        .alive()
+        .revoked(false)
+        .key_flags(signing_flag)
+        .collect();
+
+    if candidates.iter().any(|k| k.key().fingerprint() == hsm_fpr) {
+        return Ok(hsm_fpr);
+    }
+
+    // No match.  Distinguish "key isn't bound at all" (operator picked
+    // the wrong --key-label / --creation-time, or the wrong cert) from
+    // "key is bound but isn't currently a valid signer" (revoked,
+    // expired, or signing flag missing).  Different operator fixes.
+    let bound_at_all = cert.keys().any(|k| k.key().fingerprint() == hsm_fpr);
+    if bound_at_all {
+        anyhow::bail!(
+            "HSM key {hsm_fpr} is present in {} but is not currently a valid signer \
+             at {} (revoked, expired, or not signing-capable); \
+             current valid signing keys: [{}]",
+            cert_path.display(),
+            humantime::format_rfc3339(at_time),
+            candidates
+                .iter()
+                .map(|k| k.key().fingerprint().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    } else {
+        anyhow::bail!(
+            "HSM key {hsm_fpr} is not bound to {} at all; \
+             either --key-label / --creation-time disagree with the cert, \
+             or the wrong cert was supplied",
+            cert_path.display(),
+        );
+    }
+}
+
+fn cmd_verify_signing_key(pkcs11: &Pkcs11, args: VerifySigningKeyArgs) -> anyhow::Result<()> {
     let selector = args.key.resolve()?;
     let login = args.auth.login_mode()?;
     let creation_time = require_creation_time(
@@ -1403,79 +1666,19 @@ fn cmd_verify_signing_key(pkcs11: &Pkcs11, args: VerifySigningKeyArgs) -> anyhow
     let mut signer = Pkcs11Signer::new(session, priv_handle)?;
     signer.set_creation_time(creation_time)?;
 
-    let hsm_key = sequoia_openpgp::packet::Key::V4(sequoia_openpgp::packet::key::Key4::<
-        sequoia_openpgp::packet::key::PublicParts,
-        sequoia_openpgp::packet::key::PrimaryRole,
-    >::new(
+    let hsm_fpr = require_current_signer(
+        &cert,
+        signer.public_key(),
         creation_time,
-        signer.public_key().pk_algo(),
-        signer.public_key().mpis().clone(),
-    )?);
-    let hsm_fpr = hsm_key.fingerprint();
-
-    // Apply Sequoia's StandardPolicy at the chosen reference time.
-    // ValidCert::keys() yields keys whose binding signatures are valid
-    // under that policy at that time.  Filtering on .alive() rejects
-    // expired keys; .revoked(false) rejects revoked keys; key_flags()
-    // restricts to signing-capable.
-    //
-    // We accept BOTH the primary and any subkey as a valid match: a
-    // single-tier cert (no subkeys, primary carries the signing flag)
-    // is a reasonable deployment that we shouldn't reject here.  Any
-    // policy that requires a specific structure (e.g. "release artefacts
-    // must be signed by a subkey, never the primary") belongs in the
-    // operator's wrapper, not in this generic primitive.
-    let policy = StandardPolicy::new();
-    let valid = cert.with_policy(&policy, at_time).with_context(|| {
-        format!(
-            "input cert {} fails StandardPolicy validation at {}",
-            args.input_cert.display(),
-            humantime::format_rfc3339(at_time),
-        )
-    })?;
-
-    let signing_flag = KeyFlags::empty().set_signing();
-    let candidates: Vec<_> = valid
-        .keys()
-        .alive()
-        .revoked(false)
-        .key_flags(signing_flag)
-        .collect();
-
-    if candidates.iter().any(|k| k.key().fingerprint() == hsm_fpr) {
-        println!(
-            "OK: HSM key {hsm_fpr} is a current signing key in {}",
-            args.input_cert.display()
-        );
-        return Ok(());
-    }
-
-    // No match.  Distinguish "key isn't bound at all" (operator picked
-    // the wrong --key-label / --creation-time, or the wrong cert) from
-    // "key is bound but isn't currently a valid signer" (revoked,
-    // expired, or signing flag missing).  Different operator fixes.
-    let bound_at_all = cert.keys().any(|k| k.key().fingerprint() == hsm_fpr);
-    if bound_at_all {
-        anyhow::bail!(
-            "HSM key {hsm_fpr} is present in {} but is not currently a valid signer \
-             at {} (revoked, expired, or not signing-capable); \
-             current valid signing keys: [{}]",
-            args.input_cert.display(),
-            humantime::format_rfc3339(at_time),
-            candidates
-                .iter()
-                .map(|k| k.key().fingerprint().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    } else {
-        anyhow::bail!(
-            "HSM key {hsm_fpr} is not bound to {} at all; \
-             either --key-label / --creation-time disagree with the cert, \
-             or the wrong cert was supplied",
-            args.input_cert.display(),
-        );
-    }
+        at_time,
+        &args.input_cert,
+    )?;
+    println!(
+        "OK: HSM key {hsm_fpr} ({}) is a current signing key in {}",
+        describe_key_algo(signer.public_key()),
+        args.input_cert.display()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1622,6 +1825,129 @@ fn get_str_attr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A public key with the given MPIs, for the algorithm-policy tests.
+    /// Only the material matters here; the creation time never participates
+    /// in an algorithm check.
+    fn public_key_with(
+        algo: sequoia_openpgp::types::PublicKeyAlgorithm,
+        mpis: sequoia_openpgp::crypto::mpi::PublicKey,
+    ) -> sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    > {
+        sequoia_openpgp::packet::Key::V4(
+            sequoia_openpgp::packet::key::Key4::<
+                sequoia_openpgp::packet::key::PublicParts,
+                sequoia_openpgp::packet::key::PrimaryRole,
+            >::new(std::time::SystemTime::UNIX_EPOCH, algo, mpis)
+            .unwrap()
+            .role_into_unspecified(),
+        )
+    }
+
+    fn rsa_key(
+        bits: usize,
+    ) -> sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    > {
+        use sequoia_openpgp::crypto::mpi;
+        // A modulus of exactly `bits` bits: leading byte 0x80 sets the top
+        // bit, which is what makes MPI::bits() report the nominal size.
+        let mut n = vec![0xffu8; bits / 8];
+        n[0] = 0x80;
+        public_key_with(
+            sequoia_openpgp::types::PublicKeyAlgorithm::RSAEncryptSign,
+            mpi::PublicKey::RSA {
+                e: mpi::MPI::new(&[0x01, 0x00, 0x01]),
+                n: mpi::MPI::new(&n),
+            },
+        )
+    }
+
+    fn ecdsa_key(
+        curve: sequoia_openpgp::types::Curve,
+    ) -> sequoia_openpgp::packet::Key<
+        sequoia_openpgp::packet::key::PublicParts,
+        sequoia_openpgp::packet::key::UnspecifiedRole,
+    > {
+        use sequoia_openpgp::crypto::mpi;
+        let len = curve.field_size().unwrap();
+        let mut point = vec![0x04u8];
+        point.extend(std::iter::repeat_n(0x01u8, len * 2));
+        public_key_with(
+            sequoia_openpgp::types::PublicKeyAlgorithm::ECDSA,
+            mpi::PublicKey::ECDSA {
+                curve,
+                q: mpi::MPI::new(&point),
+            },
+        )
+    }
+
+    #[test]
+    fn require_key_algo_matches_the_exact_size() {
+        assert!(key_matches_algo(&rsa_key(4096), RequiredKeyAlgo::Rsa4096));
+        assert!(key_matches_algo(&rsa_key(3072), RequiredKeyAlgo::Rsa3072));
+        assert!(key_matches_algo(&rsa_key(2048), RequiredKeyAlgo::Rsa2048));
+    }
+
+    #[test]
+    fn require_key_algo_is_exact_not_a_minimum() {
+        // A stronger key is still the wrong key: the flag states which key is
+        // in use, not a floor.  RSA-8192 must not satisfy an rsa4096 policy.
+        assert!(!key_matches_algo(&rsa_key(8192), RequiredKeyAlgo::Rsa4096));
+        assert!(!key_matches_algo(&rsa_key(3072), RequiredKeyAlgo::Rsa4096));
+    }
+
+    #[test]
+    fn require_key_algo_does_not_confuse_rsa_with_ecdsa() {
+        use sequoia_openpgp::types::Curve;
+        // The EL9 case that motivates the flag: ECDSA where RSA was required
+        // must be refused, because rpm 4.16 cannot verify it at all.
+        assert!(!key_matches_algo(
+            &ecdsa_key(Curve::NistP384),
+            RequiredKeyAlgo::Rsa4096
+        ));
+        assert!(!key_matches_algo(&rsa_key(4096), RequiredKeyAlgo::P384));
+    }
+
+    #[test]
+    fn require_key_algo_distinguishes_curves() {
+        use sequoia_openpgp::types::Curve;
+        assert!(key_matches_algo(
+            &ecdsa_key(Curve::NistP256),
+            RequiredKeyAlgo::P256
+        ));
+        assert!(key_matches_algo(
+            &ecdsa_key(Curve::NistP384),
+            RequiredKeyAlgo::P384
+        ));
+        assert!(!key_matches_algo(
+            &ecdsa_key(Curve::NistP256),
+            RequiredKeyAlgo::P384
+        ));
+    }
+
+    #[test]
+    fn describe_key_algo_reports_what_the_policy_names() {
+        use sequoia_openpgp::types::Curve;
+        // The diagnostic and the policy value share one vocabulary, so the
+        // error message names something the operator can pass back verbatim.
+        assert_eq!(describe_key_algo(&rsa_key(4096)), "RSA-4096");
+        assert_eq!(
+            describe_key_algo(&ecdsa_key(Curve::NistP384)),
+            "ECDSA P-384"
+        );
+        assert_eq!(
+            describe_key_algo(&rsa_key(4096)),
+            RequiredKeyAlgo::Rsa4096.as_str()
+        );
+        assert_eq!(
+            describe_key_algo(&ecdsa_key(Curve::NistP384)),
+            RequiredKeyAlgo::P384.as_str()
+        );
+    }
 
     #[test]
     fn creation_time_omitted_is_an_error_not_epoch() {

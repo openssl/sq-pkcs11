@@ -317,6 +317,111 @@ def test_sign_requires_a_creation_time_or_an_input_cert(
     assert not (work / "p.txt.asc").exists(), "no output when it refuses to run"
 
 
+# ---------------------------------------------------------------------------
+# Refusing to sign: key policy, and the --input-cert signer pre-flight
+# ---------------------------------------------------------------------------
+
+
+def test_require_key_algo_accepts_the_matching_key(
+    sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path
+):
+    payload = work / "p.txt"
+    payload.write_bytes(b"policy ok\n")
+    sqp11.run(
+        "sign",
+        "--key-label",
+        pkcs11.rsa,
+        "--creation-time",
+        STABLE_TIME,
+        "--require-key-algo",
+        "rsa4096",
+        payload,
+    ).success()
+    assert (work / "p.txt.asc").exists()
+
+
+def test_require_key_algo_refuses_the_wrong_algorithm(
+    sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path
+):
+    """The EL9 case: rpm 4.16 cannot verify ECDSA at all.
+
+    Signing with the wrong key type is only discovered by the consumer, when
+    `rpm --import` rejects the certificate — long after publication.  Stating
+    the policy turns that into a refusal here.
+    """
+    payload = work / "p.txt"
+    payload.write_bytes(b"wrong algorithm\n")
+    result = sqp11.run(
+        "sign",
+        "--key-label",
+        pkcs11.ec,  # a NIST-curve key, not RSA
+        "--creation-time",
+        STABLE_TIME,
+        "--require-key-algo",
+        "rsa4096",
+        payload,
+    ).failure()
+    assert "--require-key-algo RSA-4096" in result.stderr
+    assert "ECDSA" in result.stderr, "the error should name what the key actually is"
+    assert not (work / "p.txt.asc").exists(), "nothing may be signed when policy refuses"
+
+
+def test_input_cert_refuses_a_key_that_is_no_longer_a_valid_signer(
+    export_cert, sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path
+):
+    """`--input-cert` proves current validity, not just presence.
+
+    Matching key material alone is not enough: an old subkey stays in a
+    published cert on purpose, so the signatures it already made keep
+    verifying.  Material matching would therefore sign happily with a
+    rotated-out or expired key and produce an artefact every policy-applying
+    verifier rejects.  Here the cert has lapsed, so the key is present but no
+    longer live.
+    """
+    expired = export_cert(
+        "rsa",
+        userid="Expired <expired@example.com>",
+        creation_time="2020-01-01T00:00:00Z",
+        extra=["--validity-period", "1y"],
+        name="expired.asc",
+    )
+    payload = work / "p.txt"
+    payload.write_bytes(b"expired signer\n")
+
+    result = sqp11.run(
+        "sign", "--key-label", pkcs11.rsa, "--input-cert", expired, payload
+    ).failure()
+    assert "refusing to sign" in result.stderr, result.stderr
+    assert "--no-verify-signing-key" in result.stderr, "the error should name the override"
+    assert not (work / "p.txt.asc").exists(), "nothing may be signed when the check fails"
+
+
+def test_no_verify_signing_key_signs_anyway(
+    export_cert, sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path
+):
+    """The deliberate escape hatch, so the strictness stays usable."""
+    expired = export_cert(
+        "rsa",
+        userid="Expired <expired@example.com>",
+        creation_time="2020-01-01T00:00:00Z",
+        extra=["--validity-period", "1y"],
+        name="expired.asc",
+    )
+    payload = work / "p.txt"
+    payload.write_bytes(b"expired signer, asked for anyway\n")
+
+    sqp11.run(
+        "sign",
+        "--key-label",
+        pkcs11.rsa,
+        "--input-cert",
+        expired,
+        "--no-verify-signing-key",
+        payload,
+    ).success()
+    assert (work / "p.txt.asc").exists()
+
+
 def test_creation_time_epoch_still_works_when_asked_for_explicitly(
     sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path
 ):

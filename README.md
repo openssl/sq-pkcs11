@@ -282,6 +282,49 @@ matches, it errors. An explicit `--creation-time` still wins, and warns if it
 disagrees with the cert — see [Stable
 fingerprints](#stable-fingerprints---creation-time) for why the value matters.
 
+`--input-cert` also **proves the key is a current valid signer** in that cert
+before signing anything — not revoked, not expired, carrying the signing flag.
+Material matching alone would not: an old subkey stays in a published cert on
+purpose, so the signatures it already made keep verifying, and matching it
+would sign happily with a rotated-out key. The check costs no HSM operation
+and runs before the first one, so a refusal writes nothing and leaves no
+key-usage entry in the audit log.
+
+```
+$ sq-pkcs11 sign --key-label ossl-2026 --input-cert release.asc openssl-3.6.0.tar.gz
+Error: refusing to sign: the key is not a current valid signer in --input-cert
+       (pass --no-verify-signing-key to sign anyway)
+Caused by:
+    HSM key 6B98…2C7B is present in release.asc but is not currently a valid
+    signer at 2026-08-08T06:13:23Z (revoked, expired, or not signing-capable)
+```
+
+`--no-verify-signing-key` signs anyway, for the deliberate case. The same check
+is also a command of its own, `verify-signing-key`, for running the pre-flight
+without signing; it requires an explicit `--creation-time` and never derives one
+from the cert, since reading the timestamp out of the cert being checked would
+make it pass by construction.
+
+### Pinning the key algorithm
+
+`--require-key-algo` refuses to sign unless the key is exactly the stated
+algorithm and size:
+
+```sh
+./sq-pkcs11 sign --require-key-algo rsa4096 \
+  --key-label my-signing-key --input-cert release.asc openssl-3.6.0.tar.gz
+```
+
+Accepted values: `rsa2048`, `rsa3072`, `rsa4096`, `p256`, `p384`, `p521`. The
+match is **exact, not a minimum** — `rsa4096` rejects RSA-3072 *and* RSA-8192,
+because the flag states which key is in use rather than a floor.
+
+This exists because the cost of the wrong key type is paid by the consumer:
+rpm 4.16 on EL9 cannot verify ECDSA at all, so a package signed with an ECDSA
+key fails at `rpm --import` long after publication (see [rpm parser
+compatibility](contrib/README.md#rpm-parser-compatibility)). Naming the policy
+at the call site turns that into a refusal to sign.
+
 Verify with GnuPG:
 
 ```sh
