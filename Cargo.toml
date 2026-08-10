@@ -1,6 +1,6 @@
 [package]
 name = "sq-pkcs11"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 # Floor is set by the largest transitive in our dependency graph: as of
 # sequoia-openpgp 2.2, the idna_adapter 1.2.x → icu_* 2.2 chain requires
