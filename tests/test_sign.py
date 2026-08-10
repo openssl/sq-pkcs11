@@ -197,6 +197,73 @@ def test_binary_signature_creation_time_subpacket_is_hashed_but_not_critical(
 
 
 # ---------------------------------------------------------------------------
+# Message-hash selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("form", ["armored", "binary"])
+def test_message_hash_matches_the_curve(
+    form: str, sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path
+):
+    """A P-384 key must sign under SHA-384, in every output form.
+
+    cert::preferred_hash_for pairs each curve with its SP 800-57 hash and the
+    sign path sets it on the signature template.  That is enough for --binary,
+    which builds the packet from the template directly, but NOT for the
+    streaming forms: Signer::with_template ignores the template's hash and
+    keeps its own field, which falls back to the first entry of Sequoia's
+    default_hashes() -- SHA-512.  Until the streaming builders were given
+    .hash_algo() too, a P-384 key signed under SHA-512 while its own cert
+    self-signatures used SHA-384.
+
+    Benign in itself -- ECDSA truncates the longer hash -- but the tool should
+    do what it says, and the divergence is invisible on an RSA key, where the
+    intended hash is SHA-512 anyway.
+    """
+    payload = work / "p.txt"
+    payload.write_bytes(b"curve/hash pairing\n")
+    signature = work / ("p.txt.sig" if form == "binary" else "p.txt.asc")
+
+    args = ["sign", "--key-label", pkcs11.ec, "--creation-time", STABLE_TIME]
+    if form == "binary":
+        args += ["--binary"]
+    args += ["--output", signature, payload]
+    sqp11.run(*args).success()
+
+    text = sq_inspect.assert_one_signature_packet(signature, f"sign ({form})")
+    got = sq_inspect.field(text, "Hash algo")
+    assert got == "SHA384", (
+        f"P-384 key signed under {got}; the streaming signer needs "
+        ".hash_algo() as well as the template"
+    )
+
+
+def test_message_hash_for_rsa_is_unchanged(sqp11: SqPkcs11, pkcs11: Pkcs11Config, work: Path):
+    """Pinning the curve pairing must not disturb the RSA default.
+
+    RSA has no curve to pair with, so preferred_hash_for returns SHA-512 --
+    the hash every existing release-tarball and rpm signature already uses.
+    """
+    payload = work / "r.txt"
+    payload.write_bytes(b"rsa hash\n")
+    signature = work / "r.txt.asc"
+
+    sqp11.run(
+        "sign",
+        "--key-label",
+        pkcs11.rsa,
+        "--creation-time",
+        STABLE_TIME,
+        "--output",
+        signature,
+        payload,
+    ).success()
+
+    text = sq_inspect.assert_one_signature_packet(signature, "sign (rsa)")
+    assert sq_inspect.field(text, "Hash algo") == "SHA512"
+
+
+# ---------------------------------------------------------------------------
 # Cleartext Signature Framework (apt's InRelease)
 # ---------------------------------------------------------------------------
 

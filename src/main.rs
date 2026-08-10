@@ -1072,7 +1072,13 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
         {
             let sink = Message::new(&mut buf);
             let template = SignatureBuilder::new(SignatureType::Text).set_hash_algo(hash_algo);
+            // .hash_algo() as well as the template: Signer::with_template does
+            // not take the message hash from the template — it keeps its own
+            // field, unset by default, which falls back to the first entry of
+            // default_hashes() (SHA-512).  Setting only the template silently
+            // signs a P-384 key under SHA-512.
             let mut signing_stream = Signer::with_template(sink, signer, template)?
+                .hash_algo(hash_algo)?
                 .cleartext()
                 .build()?;
             signing_stream.write_all(&data)?;
@@ -1113,7 +1119,10 @@ fn cmd_sign(pkcs11: &Pkcs11, args: SignArgs) -> anyhow::Result<()> {
             // standalone signature rather than an OpenPGP message.
             let sink = Armorer::new(sink).kind(armor::Kind::Signature).build()?;
             let template = SignatureBuilder::new(SignatureType::Binary).set_hash_algo(hash_algo);
+            // See the cleartext branch: the template alone does not set the
+            // message hash on a streaming signer.
             let mut signing_stream = Signer::with_template(sink, signer, template)?
+                .hash_algo(hash_algo)?
                 .detached()
                 .build()?;
             signing_stream.write_all(&data)?;
